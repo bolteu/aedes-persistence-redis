@@ -185,19 +185,6 @@ test('multiple persistences', function (t) {
     }
   }
 
-  instance2._waitFor(client, 'sub_' + 'hello', function () {
-    instance2.subscriptionsByTopic('hello', function (err, resubs) {
-      t.notOk(err, 'subs by topic no error')
-      t.deepEqual(resubs, [{
-        clientId: client.id,
-        topic: 'hello',
-        qos: 1
-      }])
-      gotSubs = true
-      close()
-    })
-  })
-
   var ready = false
   var ready2 = false
 
@@ -206,7 +193,16 @@ test('multiple persistences', function (t) {
       instance.addSubscriptions(client, subs, function (err) {
         t.notOk(err, 'add subs no error')
         addedSubs = true
-        close()
+        instance2.subscriptionsByTopic('hello', function (err, resubs) {
+          t.notOk(err, 'subs by topic no error')
+          t.deepEqual(resubs, [{
+            clientId: client.id,
+            topic: 'hello',
+            qos: 1
+          }])
+          gotSubs = true
+          close()
+        })
       })
     }
   }
