@@ -3,21 +3,12 @@
 const Redis = require('ioredis')
 const Stream = require('stream')
 const from = require('from2')
-const through = require('through2')
 const throughv = require('throughv')
 const msgpack = require('msgpack-lite')
-const pump = require('pump')
 const CachedPersistence = require('aedes-cached-persistence')
 const Packet = CachedPersistence.Packet
 const inherits = require('util').inherits
 const HLRU = require('hashlru')
-const QlobberTrue = require('qlobber').QlobberTrue
-const qlobberOpts = {
-  separator: '/',
-  wildcard_one: '+',
-  wildcard_some: '#',
-  match_empty_levels: true
-}
 const clientKey = 'client:'
 const clientsKey = 'clients'
 const subscribersKey = 'subscribers:'
@@ -46,7 +37,6 @@ function RedisPersistence (opts) {
     this._db = opts.conn || new Redis(opts)
   }
 
-  this._getRetainedChunkBound = this._getRetainedChunk.bind(this)
   CachedPersistence.call(this, opts)
 }
 
@@ -60,42 +50,28 @@ RedisPersistence.prototype.storeRetained = function (packet, cb) {
   }
 }
 
-RedisPersistence.prototype._getRetainedChunk = function (chunk, enc, cb) {
-  this._db.hgetBuffer(retainedKey, chunk, cb)
-}
-
 RedisPersistence.prototype.createRetainedStreamCombi = function (patterns) {
-  var that = this
-  var qlobber = new QlobberTrue(qlobberOpts)
-
+  const stream = throughv.obj(decodeRetainedPacket)
+  let c = 0
   for (var i = 0; i < patterns.length; i++) {
-    qlobber.add(patterns[i])
+    this._db.hgetBuffer(retainedKey, patterns[i], (err, data) => {
+      if (err) {
+        stream.emit('error', err)
+      }
+      if (data !== null) {
+        stream.write(data)
+      }
+      if (++c === patterns.length) {
+        stream.end()
+      }
+    })
   }
 
-  var stream = through.obj(that._getRetainedChunkBound)
-
-  this._db.hkeys(retainedKey, function getKeys (err, keys) {
-    if (err) {
-      stream.emit('error', err)
-    } else {
-      matchRetained(stream, keys, qlobber)
-    }
-  })
-
-  return pump(stream, throughv.obj(decodeRetainedPacket))
+  return stream
 }
 
 RedisPersistence.prototype.createRetainedStream = function (pattern) {
   return this.createRetainedStreamCombi([pattern])
-}
-
-function matchRetained (stream, keys, qlobber) {
-  for (var i = 0, l = keys.length; i < l; i++) {
-    if (qlobber.test(keys[i])) {
-      stream.write(keys[i])
-    }
-  }
-  stream.end()
 }
 
 function decodeRetainedPacket (chunk, enc, cb) {
