@@ -169,9 +169,6 @@ test('multiple persistences', function (t) {
     topic: 'hello',
     qos: 1
   }, {
-    topic: 'hello/#',
-    qos: 1
-  }, {
     topic: 'matteo',
     qos: 1
   }]
@@ -192,10 +189,6 @@ test('multiple persistences', function (t) {
     instance2.subscriptionsByTopic('hello', function (err, resubs) {
       t.notOk(err, 'subs by topic no error')
       t.deepEqual(resubs, [{
-        clientId: client.id,
-        topic: 'hello/#',
-        qos: 1
-      }, {
         clientId: client.id,
         topic: 'hello',
         qos: 1
