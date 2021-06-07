@@ -62,7 +62,7 @@
     "tape": "^4.13.2"
   },
   "dependencies": {
-    "aedes-cached-persistence": "git+ssh://git@github.com:bolteu/aedes-cached-persistence.git#e7955f2eb2f11ce9f4877",
+    "aedes-cached-persistence": "git+ssh://git@github.com:bolteu/aedes-cached-persistence.git#8d193ec250ba857dca",
     "from2": "^2.3.0",
     "hashlru": "^2.3.0",
     "ioredis": "^4.17.3",
