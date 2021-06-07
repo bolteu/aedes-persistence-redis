@@ -2,7 +2,6 @@
 
 const Redis = require('ioredis')
 const Stream = require('stream')
-const from = require('from2')
 const throughv = require('throughv')
 const msgpack = require('msgpack-lite')
 const CachedPersistence = require('aedes-cached-persistence')
@@ -567,41 +566,20 @@ RedisPersistence.prototype.streamWill = function (brokers) {
 
 // Only used from tests
 RedisPersistence.prototype.getClientList = function (topic) {
-  // var entries = this._trie.match(topic, topic)
-
   const subKey = subscribersKey + topic
-  var entries = null
-  var savedNext = null
-  var error
+  var stream = new Stream()
   this._db.hgetall(subKey, function clientHash (err, data) {
     if (err) {
-      error = err
-    }
-    entries = Object.keys(data)
-    if (savedNext) {
-      pushClientList(1, savedNext)
-    }
-  })
-
-  function pushClientList (size, next) {
-    if (entries === null) {
-      savedNext = next
+      stream.emit(err)
       return
     }
-    if (entries.length === 0) {
-      return next(null, null)
+    var entries = Object.keys(data)
+    for (const entry of entries) {
+      stream.emit('data', entry)
     }
-    var chunk = entries.slice(0, 1)
-    entries = entries.slice(1)
-    next(null, chunk[0])
-  }
-
-  if (error) {
-    var stream = new Stream()
-    stream.emit('error', error)
-    return stream
-  }
-  return from.obj(pushClientList)
+    stream.emit('end')
+  })
+  return stream
 }
 
 RedisPersistence.prototype._buildAugment = function (listKey) {
