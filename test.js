@@ -13,7 +13,7 @@ db.on('error', function (e) {
 
 db.on('connect', unref)
 
-function unref () {
+function unref() {
   this.connector.stream.unref()
 }
 
@@ -60,7 +60,7 @@ abs({
   waitForReady: true
 })
 
-function toBroker (id, emitter) {
+function toBroker(id, emitter) {
   return {
     id: id,
     publish: emitter.emit.bind(emitter),
@@ -94,7 +94,7 @@ test('packet ttl', function (t) {
     brokerId: instance.broker.id,
     brokerCounter: 42
   }
-  instance.outgoingEnqueueCombi(subs, packet, function enqueued (err, saved) {
+  instance.outgoingEnqueueCombi(subs, packet, function enqueued(err, saved) {
     t.notOk(err)
     t.deepEqual(saved, packet)
     setTimeout(function () {
@@ -139,10 +139,10 @@ test('outgoingUpdate doesn\'t clear packet ttl', function (t) {
     brokerCounter: 42,
     messageId: 123
   }
-  instance.outgoingEnqueueCombi(subs, packet, function enqueued (err, saved) {
+  instance.outgoingEnqueueCombi(subs, packet, function enqueued(err, saved) {
     t.notOk(err)
     t.deepEqual(saved, packet)
-    instance.outgoingUpdate(client, packet, function updated () {
+    instance.outgoingUpdate(client, packet, function updated() {
       setTimeout(function () {
         db.exists('packet:1:42', (_, exists) => {
           t.notOk(exists, 'packet key should have expired')
@@ -154,8 +154,82 @@ test('outgoingUpdate doesn\'t clear packet ttl', function (t) {
   })
 })
 
+test('test unsubscribe', function(t) {
+  t.plan(8)
+  db.flushall()
+  var emitter = mqemitterRedis()
+  var instance = persistence()
+  instance.broker = toBroker('1', emitter)
+
+  var client = { id: 'remove_sub' }
+
+  function close() {
+    instance.destroy(t.pass.bind(t, 'instance dies'))
+    emitter.close(t.pass.bind(t, 'emitter dies'))
+  }
+
+  instance.addSubscriptions(client, [{topic: 't1', qos: 2}], function (err) {
+    t.notOk(err, 'add subs no error')
+    instance.subscriptionsByTopic('t1', function (err2, resubs) {
+      t.notOk(err2, 'subs by topic no error')
+      t.deepEqual(resubs, [{
+        clientId: client.id,
+        topic: 't1',
+        qos: 2
+      }])
+
+      instance.removeSubscriptions(client, ['t1'], function (err3) {
+        t.notOk(err3, 'subs by topic no error')
+        instance.subscriptionsByTopic('t1', function (err4, resubs) {
+          t.notOk(err4, 'subs by topic no error')
+          t.deepEqual(resubs, [])
+          close();
+        });
+      });
+
+    });
+  });
+})
+
+test('test re-subscription by qos 0', function (t) {
+  t.plan(8)
+  db.flushall()
+  var emitter = mqemitterRedis()
+  var instance = persistence()
+  instance.broker = toBroker('1', emitter)
+
+  var client = { id: 'resub_qos0' }
+
+  function close() {
+    instance.destroy(t.pass.bind(t, 'instance dies'))
+    emitter.close(t.pass.bind(t, 'emitter dies'))
+  }
+
+  instance.addSubscriptions(client, [{topic: 't1', qos: 2}], function (err) {
+    t.notOk(err, 'add subs no error')
+    instance.subscriptionsByTopic('t1', function (err2, resubs) {
+      t.notOk(err2, 'subs by topic no error')
+      t.deepEqual(resubs, [{
+        clientId: client.id,
+        topic: 't1',
+        qos: 2
+      }])
+
+      instance.addSubscriptions(client, [{topic: 't1', qos: 0}], function (err3) {
+        t.notOk(err3, 'subs by topic no error')
+        instance.subscriptionsByTopic('t1', function (err4, resubs) {
+          t.notOk(err4, 'subs by topic no error')
+          t.deepEqual(resubs, [])
+          close();
+        });
+      });
+
+    });
+  });
+});
+
 test('multiple persistences', function (t) {
-  t.plan(7)
+  t.plan(11)
   db.flushall()
   var emitter = mqemitterRedis()
   var emitter2 = mqemitterRedis()
@@ -171,50 +245,39 @@ test('multiple persistences', function (t) {
   }, {
     topic: 'matteo',
     qos: 1
+  }, {
+    topic: 'zeroqos',
+    qos: 0
   }]
 
-  var gotSubs = false
-  var addedSubs = false
-
-  function close () {
-    if (gotSubs && addedSubs) {
-      instance.destroy(t.pass.bind(t, 'first dies'))
-      instance2.destroy(t.pass.bind(t, 'second dies'))
-      emitter.close(t.pass.bind(t, 'first emitter dies'))
-      emitter2.close(t.pass.bind(t, 'second emitter dies'))
-    }
+  function close() {
+    instance.destroy(t.pass.bind(t, 'first dies'))
+    instance2.destroy(t.pass.bind(t, 'second dies'))
+    emitter.close(t.pass.bind(t, 'first emitter dies'))
+    emitter2.close(t.pass.bind(t, 'second emitter dies'))
   }
 
-  var ready = false
-  var ready2 = false
+  instance.addSubscriptions(client, subs, function (err) {
+    t.notOk(err, 'add subs no error')
+    instance2.subscriptionsByTopic('hello', function (err, resubs) {
+      t.notOk(err, 'subs by topic no error')
+      t.deepEqual(resubs, [{
+        clientId: client.id,
+        topic: 'hello',
+        qos: 1
+      }])
+      instance2.subscriptionsByTopic('wrongtopic', function (err2, resubs2) {
+        t.notOk(err2, 'subs2 by topic no error')
+        t.deepEqual(resubs2, []);
 
-  function addSubs () {
-    if (ready && ready2) {
-      instance.addSubscriptions(client, subs, function (err) {
-        t.notOk(err, 'add subs no error')
-        addedSubs = true
-        instance2.subscriptionsByTopic('hello', function (err, resubs) {
-          t.notOk(err, 'subs by topic no error')
-          t.deepEqual(resubs, [{
-            clientId: client.id,
-            topic: 'hello',
-            qos: 1
-          }])
-          gotSubs = true
+        instance2.subscriptionsByTopic('zeroqos', function (err3, resubs3) {
+          t.notOk(err3, 'subs3 by topic no error')
+          t.deepEqual(resubs3, []);
+
           close()
-        })
-      })
-    }
-  }
-
-  instance.on('ready', function () {
-    ready = true
-    addSubs()
-  })
-
-  instance2.on('ready', function () {
-    ready2 = true
-    addSubs()
+        });
+      });
+    })
   })
 })
 
@@ -235,7 +298,7 @@ test('unknown cache key', function (t) {
     retain: false
   }
 
-  function close () {
+  function close() {
     instance.destroy(t.pass.bind(t, 'instance dies'))
     emitter.close(t.pass.bind(t, 'emitter dies'))
   }
