@@ -13,7 +13,7 @@ db.on('error', function (e) {
 
 db.on('connect', unref)
 
-function unref() {
+function unref () {
   this.connector.stream.unref()
 }
 
@@ -60,7 +60,7 @@ abs({
   waitForReady: true
 })
 
-function toBroker(id, emitter) {
+function toBroker (id, emitter) {
   return {
     id: id,
     publish: emitter.emit.bind(emitter),
@@ -94,7 +94,7 @@ test('packet ttl', function (t) {
     brokerId: instance.broker.id,
     brokerCounter: 42
   }
-  instance.outgoingEnqueueCombi(subs, packet, function enqueued(err, saved) {
+  instance.outgoingEnqueueCombi(subs, packet, function enqueued (err, saved) {
     t.notOk(err)
     t.deepEqual(saved, packet)
     setTimeout(function () {
@@ -139,10 +139,10 @@ test('outgoingUpdate doesn\'t clear packet ttl', function (t) {
     brokerCounter: 42,
     messageId: 123
   }
-  instance.outgoingEnqueueCombi(subs, packet, function enqueued(err, saved) {
+  instance.outgoingEnqueueCombi(subs, packet, function enqueued (err, saved) {
     t.notOk(err)
     t.deepEqual(saved, packet)
-    instance.outgoingUpdate(client, packet, function updated() {
+    instance.outgoingUpdate(client, packet, function updated () {
       setTimeout(function () {
         db.exists('packet:1:42', (_, exists) => {
           t.notOk(exists, 'packet key should have expired')
@@ -154,7 +154,7 @@ test('outgoingUpdate doesn\'t clear packet ttl', function (t) {
   })
 })
 
-test('test unsubscribe', function(t) {
+test('test unsubscribe', function (t) {
   t.plan(8)
   db.flushall()
   var emitter = mqemitterRedis()
@@ -163,12 +163,12 @@ test('test unsubscribe', function(t) {
 
   var client = { id: 'remove_sub' }
 
-  function close() {
+  function close () {
     instance.destroy(t.pass.bind(t, 'instance dies'))
     emitter.close(t.pass.bind(t, 'emitter dies'))
   }
 
-  instance.addSubscriptions(client, [{topic: 't1', qos: 2}], function (err) {
+  instance.addSubscriptions(client, [{ topic: 't1', qos: 2 }], function (err) {
     t.notOk(err, 'add subs no error')
     instance.subscriptionsByTopic('t1', function (err2, resubs) {
       t.notOk(err2, 'subs by topic no error')
@@ -183,12 +183,11 @@ test('test unsubscribe', function(t) {
         instance.subscriptionsByTopic('t1', function (err4, resubs) {
           t.notOk(err4, 'subs by topic no error')
           t.deepEqual(resubs, [])
-          close();
-        });
-      });
-
-    });
-  });
+          close()
+        })
+      })
+    })
+  })
 })
 
 test('test re-subscription by qos 0', function (t) {
@@ -200,12 +199,12 @@ test('test re-subscription by qos 0', function (t) {
 
   var client = { id: 'resub_qos0' }
 
-  function close() {
+  function close () {
     instance.destroy(t.pass.bind(t, 'instance dies'))
     emitter.close(t.pass.bind(t, 'emitter dies'))
   }
 
-  instance.addSubscriptions(client, [{topic: 't1', qos: 2}], function (err) {
+  instance.addSubscriptions(client, [{ topic: 't1', qos: 2 }], function (err) {
     t.notOk(err, 'add subs no error')
     instance.subscriptionsByTopic('t1', function (err2, resubs) {
       t.notOk(err2, 'subs by topic no error')
@@ -215,18 +214,17 @@ test('test re-subscription by qos 0', function (t) {
         qos: 2
       }])
 
-      instance.addSubscriptions(client, [{topic: 't1', qos: 0}], function (err3) {
+      instance.addSubscriptions(client, [{ topic: 't1', qos: 0 }], function (err3) {
         t.notOk(err3, 'subs by topic no error')
         instance.subscriptionsByTopic('t1', function (err4, resubs) {
           t.notOk(err4, 'subs by topic no error')
           t.deepEqual(resubs, [])
-          close();
-        });
-      });
-
-    });
-  });
-});
+          close()
+        })
+      })
+    })
+  })
+})
 
 test('multiple persistences', function (t) {
   t.plan(11)
@@ -250,7 +248,7 @@ test('multiple persistences', function (t) {
     qos: 0
   }]
 
-  function close() {
+  function close () {
     instance.destroy(t.pass.bind(t, 'first dies'))
     instance2.destroy(t.pass.bind(t, 'second dies'))
     emitter.close(t.pass.bind(t, 'first emitter dies'))
@@ -268,15 +266,15 @@ test('multiple persistences', function (t) {
       }])
       instance2.subscriptionsByTopic('wrongtopic', function (err2, resubs2) {
         t.notOk(err2, 'subs2 by topic no error')
-        t.deepEqual(resubs2, []);
+        t.deepEqual(resubs2, [])
 
         instance2.subscriptionsByTopic('zeroqos', function (err3, resubs3) {
           t.notOk(err3, 'subs3 by topic no error')
-          t.deepEqual(resubs3, []);
+          t.deepEqual(resubs3, [])
 
           close()
-        });
-      });
+        })
+      })
     })
   })
 })
@@ -298,7 +296,7 @@ test('unknown cache key', function (t) {
     retain: false
   }
 
-  function close() {
+  function close () {
     instance.destroy(t.pass.bind(t, 'instance dies'))
     emitter.close(t.pass.bind(t, 'emitter dies'))
   }

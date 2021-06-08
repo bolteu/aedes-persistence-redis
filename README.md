@@ -1,89 +1,11 @@
 # aedes-persistence-redis
 
-![.github/workflows/ci.yml](https://github.com/moscajs/aedes-persistence-redis/workflows/.github/workflows/ci.yml/badge.svg)
-[![Dependencies Status](https://david-dm.org/moscajs/aedes-persistence-redis/status.svg)](https://david-dm.org/moscajs/aedes-persistence-redis)
-[![devDependencies Status](https://david-dm.org/moscajs/aedes-persistence-redis/dev-status.svg)](https://david-dm.org/moscajs/aedes-persistence-redis?type=dev)
-\
-[![Known Vulnerabilities](https://snyk.io/test/github/moscajs/aedes-persistence-redis/badge.svg)](https://snyk.io/test/github/moscajs/aedes-persistence-redis)
-[![Coverage Status](https://coveralls.io/repos/moscajs/aedes-persistence-redis/badge.svg?branch=master&service=github)](https://coveralls.io/github/moscajs/aedes-persistence-redis?branch=master)
-[![NPM version](https://img.shields.io/npm/v/aedes-persistence-redis.svg?style=flat)](https://npm.im/aedes-persistence-redis)
-[![NPM downloads](https://img.shields.io/npm/dm/aedes-persistence-redis.svg?style=flat)](https://npm.im/aedes-persistence-redis)
+This repository is a fork from [moscajs/aedes-persistence-redis](https://github.com/moscajs/aedes-persistence-redis). 
+The reason why the fork was necessary was that the original library had scalability issues. There were two problems:
+1. [API function `subscriptionsByTopic`] Every node was keeping a local copy of list of all offline subsciptions (subscriptions by clients with non-clean sessions). This was necessary because sometimes node has to match subscriptions that have wildcards, and the best data structure to do this is a prefix tree (trie). However, Redis does not support such data structure. This was causing problems that:
+   1. Bootstrapping node became very slow and took a lot of traffic, as it had to load whole list in memory
+   2. Memory requirements for node grows linearly with the number of offline subscriptions, which does not scale.
+   
+   As we are not using wildcard subscriptions anyways, we decided to simply remove usage of this trie.
 
-Aedes Persistence, backed by [Redis][redis].
-
-See [aedes-persistence][aedes-persistence] for the full API, and [Aedes][aedes] for usage.
-
-## Install
-
-```sh
-npm install aedes aedes-persistence-redis --save
-```
-
-## API
-
-### aedesPersistenceRedis([opts])
-
-Creates a new instance of aedes-persistence-redis.
-It takes all the same options of [ioredis](https://npm.im/ioredis),
-which is used internally to connect to Redis.
-
-This constructor creates two connections to Redis.
-
-Example:
-
-```js
-aedesPersistenceRedis({
-  port: 6379,          // Redis port
-  host: '127.0.0.1',   // Redis host
-  family: 4,           // 4 (IPv4) or 6 (IPv6)
-  password: 'auth',
-  db: 0,
-  maxSessionDelivery: 100, // maximum offline messages deliverable on client CONNECT, default is 1000
-  packetTTL: function (packet) { // offline message TTL, default is disabled
-    return 10 //seconds
-  }
-})
-```
-
-Alternatively, you can pass in an externally created Redis connection using the
-`conn` option. This can be useful when connecting to a Redis cluster, for example.
-
-Example:
-
-```js
-aedesPersistenceRedis({
-  conn: new Redis.Cluster([{
-    port: 6379,
-    host: '127.0.0.1'
-  }, {
-    port: 6380,
-    host: '127.0.0.1'
-  }])
-})
-```
-
-The same as above but with `cluster` option:
-
-```js
-aedesPersistenceRedis({
-  cluster: [{
-    port: 6379,
-    host: '127.0.0.1'
-  }, {
-    port: 6380,
-    host: '127.0.0.1'
-  }]
-})
-```
-
-### Changes in v4.x
-
-v4 has changed the subscriptions key schema to enhance performance. Please check [related PR](https://github.com/moscajs/aedes-persistence-redis/pull/31) for more details.
-
-## License
-
-MIT
-
-[aedes]: https://npm.im/aedes
-[aedes-persistence]: https://npm.im/aedes-persistence
-[redis]: https://redis.io
+2. [API function `createRetainedStream`] When client subscribes, server searches for retained messages on subscribed topics. As subscription can happen by wildcards, we have the similar problem as the previous one. However, instead of keeping a local trie of retained messages, the plugin simply fetches retained messages of all topics and does the matching locally. This approach does not scale either. As we have removed wildcard subscriptions, we have solved this problem by fetching retained messages only for subscribed topics. This was easily achieved, as this information was kept in hashmap in Redis already.
