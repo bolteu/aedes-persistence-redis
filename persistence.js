@@ -1,7 +1,7 @@
 'use strict'
 
 const Redis = require('ioredis')
-const from = require('from2')
+const Stream = require('stream')
 const through = require('through2')
 const throughv = require('throughv')
 const msgpack = require('msgpack-lite')
@@ -10,15 +10,10 @@ const CachedPersistence = require('aedes-cached-persistence')
 const Packet = CachedPersistence.Packet
 const inherits = require('util').inherits
 const HLRU = require('hashlru')
-const QlobberTrue = require('qlobber').QlobberTrue
-const qlobberOpts = {
-  separator: '/',
-  wildcard_one: '+',
-  wildcard_some: '#',
-  match_empty_levels: true
-}
 const clientKey = 'client:'
 const clientsKey = 'clients'
+const subscribersKey = 'subscribers:'
+const subscriberCountKey = 'subscribers-count'
 const willsKey = 'will'
 const willKey = 'will:'
 const retainedKey = 'retained'
@@ -62,37 +57,17 @@ RedisPersistence.prototype._getRetainedChunk = function (chunk, enc, cb) {
 }
 
 RedisPersistence.prototype.createRetainedStreamCombi = function (patterns) {
-  var that = this
-  var qlobber = new QlobberTrue(qlobberOpts)
+  const patternsStream = Stream.Readable.from(patterns)
 
-  for (var i = 0; i < patterns.length; i++) {
-    qlobber.add(patterns[i])
-  }
-
-  var stream = through.obj(that._getRetainedChunkBound)
-
-  this._db.hkeys(retainedKey, function getKeys (err, keys) {
-    if (err) {
-      stream.emit('error', err)
-    } else {
-      matchRetained(stream, keys, qlobber)
-    }
-  })
-
-  return pump(stream, throughv.obj(decodeRetainedPacket))
+  return pump(
+    patternsStream,
+    through.obj(this._getRetainedChunkBound),
+    throughv.obj(decodeRetainedPacket)
+  )
 }
 
 RedisPersistence.prototype.createRetainedStream = function (pattern) {
   return this.createRetainedStreamCombi([pattern])
-}
-
-function matchRetained (stream, keys, qlobber) {
-  for (var i = 0, l = keys.length; i < l; i++) {
-    if (qlobber.test(keys[i])) {
-      stream.write(keys[i])
-    }
-  }
-  stream.end()
 }
 
 function decodeRetainedPacket (chunk, enc, cb) {
@@ -100,46 +75,70 @@ function decodeRetainedPacket (chunk, enc, cb) {
 }
 
 RedisPersistence.prototype.addSubscriptions = function (client, subs, cb) {
-  if (!this.ready) {
-    this.once('ready', this.addSubscriptions.bind(this, client, subs, cb))
-    return
-  }
-
   var clientSubKey = clientKey + client.id
 
   var toStore = {}
   var published = 0
   var errored
 
+  var waitForPublishes = 2
+
   for (var i = 0; i < subs.length; i++) {
     var sub = subs[i]
     toStore[sub.topic] = sub.qos
+
+    waitForPublishes++
+    var topicSubsciptionsKey = subscribersKey + sub.topic
+    if (sub.qos > 0) {
+      this._db.hset(topicSubsciptionsKey, client.id, sub.qos, subscriberFinishAdding)
+    } else {
+      this._db.hdel(topicSubsciptionsKey, client.id, subscriberFinishRemoving)
+    }
   }
 
   this._db.sadd(clientsKey, client.id, finish)
   this._db.hmset(clientSubKey, toStore, finish)
 
-  this._addedSubscriptions(client, subs, finish)
+  var that = this
+
+  function subscriberFinishAdding (err, t) {
+    if (t === 1) {
+      that._db.incr(subscriberCountKey)
+    }
+
+    finish(err)
+  }
+
+  function subscriberFinishRemoving (err, t) {
+    if (t === 1) {
+      that._db.decr(subscriberCountKey)
+    }
+
+    finish(err)
+  }
 
   function finish (err) {
     errored = err
     published++
-    if (published === 3) {
+    if (published === waitForPublishes) {
       cb(errored, client)
     }
   }
 }
 
 RedisPersistence.prototype.removeSubscriptions = function (client, subs, cb) {
-  if (!this.ready) {
-    this.once('ready', this.removeSubscriptions.bind(this, client, subs, cb))
-    return
-  }
-
   var clientSubKey = clientKey + client.id
 
   var errored = false
   var outstanding = 0
+  var that = this
+  function subscriptionCheck (err, t) {
+    if (t === 1) {
+      that._db.decr(subscriberCountKey)
+    }
+
+    check(err)
+  }
 
   function check (err) {
     if (err) {
@@ -159,13 +158,18 @@ RedisPersistence.prototype.removeSubscriptions = function (client, subs, cb) {
     }
   }
 
-  var that = this
   this._db.hdel(clientSubKey, subs, function subKeysRemoved (err) {
     if (err) {
       return cb(err)
     }
 
     outstanding++
+    for (const sub of subs) {
+      outstanding++
+      var topicSubsciptionsKey = subscribersKey + sub
+      that._db.hdel(topicSubsciptionsKey, client.id, subscriptionCheck)
+    }
+
     that._db.exists(clientSubKey, function checkAllSubsRemoved (err, subCount) {
       if (err) {
         return check(err)
@@ -177,16 +181,7 @@ RedisPersistence.prototype.removeSubscriptions = function (client, subs, cb) {
       }
       check()
     })
-
-    outstanding++
-    that._removedSubscriptions(client, subs.map(toSub), check)
   })
-}
-
-function toSub (topic) {
-  return {
-    topic: topic
-  }
 }
 
 RedisPersistence.prototype.subscriptionsByClient = function (client, cb) {
@@ -219,69 +214,37 @@ function returnSubsForClient (subs) {
 
 RedisPersistence.prototype.countOffline = function (cb) {
   var that = this
-
   this._db.scard(clientsKey, function countOfflineClients (err, count) {
     if (err) {
       return cb(err)
     }
 
-    cb(null, that._trie.subscriptionsCount, parseInt(count) || 0)
+    that._db.get(subscriberCountKey, function subCount (err, subCount) {
+      if (err) {
+        return cb(err)
+      }
+
+      cb(null, parseInt(subCount) || 0, parseInt(count) || 0)
+    })
   })
 }
 
 RedisPersistence.prototype.subscriptionsByTopic = function (topic, cb) {
-  if (!this.ready) {
-    this.once('ready', this.subscriptionsByTopic.bind(this, topic, cb))
-    return this
-  }
-
-  var result = this._trie.match(topic)
-
-  cb(null, result)
-}
-
-RedisPersistence.prototype._setup = function () {
-  if (this.ready) {
-    return
-  }
-
-  var that = this
-
-  var hgetallStream = throughv.obj(function getStream (clientId, enc, cb) {
-    var clientSubKey = clientKey + clientId
-    that._db.hgetall(clientSubKey, function clientHash (err, hash) {
-      cb(err, { clientHash: hash, clientId: clientId })
-    })
-  }, function emitReady (cb) {
-    that.ready = true
-    that.emit('ready')
-    cb()
-  }).on('data', function processKeys (data) {
-    processKeysForClient(data.clientId, data.clientHash, that)
-  })
-
-  this._db.smembers(clientsKey, function smembers (err, clientIds) {
+  const subKey = subscribersKey + topic
+  this._db.hgetall(subKey, function clientHash (err, data) {
     if (err) {
-      hgetallStream.emit('error', err)
-    } else {
-      for (var i = 0, l = clientIds.length; i < l; i++) {
-        hgetallStream.write(clientIds[i])
-      }
-      hgetallStream.end()
+      return cb(err, null)
     }
-  })
-}
-
-function processKeysForClient (clientId, clientHash, that) {
-  var topics = Object.keys(clientHash)
-  for (var i = 0; i < topics.length; i++) {
-    var topic = topics[i]
-    that._trie.add(topic, {
-      clientId: clientId,
-      topic: topic,
-      qos: clientHash[topic]
+    const result = Object.keys(data).map((k) => {
+      return {
+        clientId: k,
+        qos: parseInt(data[k]),
+        topic
+      }
     })
-  }
+
+    cb(null, result)
+  })
 }
 
 RedisPersistence.prototype.outgoingEnqueue = function (sub, packet, cb) {
@@ -598,19 +561,22 @@ RedisPersistence.prototype.streamWill = function (brokers) {
   return stream
 }
 
+// Only used from tests
 RedisPersistence.prototype.getClientList = function (topic) {
-  var entries = this._trie.match(topic, topic)
-
-  function pushClientList (size, next) {
-    if (entries.length === 0) {
-      return next(null, null)
+  const subKey = subscribersKey + topic
+  var stream = new Stream()
+  this._db.hgetall(subKey, function clientHash (err, data) {
+    if (err) {
+      stream.emit('error', err)
+      return
     }
-    var chunk = entries.slice(0, 1)
-    entries = entries.slice(1)
-    next(null, chunk[0].clientId)
-  }
-
-  return from.obj(pushClientList)
+    var entries = Object.keys(data)
+    for (const entry of entries) {
+      stream.emit('data', entry)
+    }
+    stream.emit('end')
+  })
+  return stream
 }
 
 RedisPersistence.prototype._buildAugment = function (listKey) {
