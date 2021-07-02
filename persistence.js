@@ -2,8 +2,10 @@
 
 const Redis = require('ioredis')
 const Stream = require('stream')
+const through = require('through2')
 const throughv = require('throughv')
 const msgpack = require('msgpack-lite')
+const pump = require('pump')
 const CachedPersistence = require('aedes-cached-persistence')
 const Packet = CachedPersistence.Packet
 const inherits = require('util').inherits
@@ -36,6 +38,7 @@ function RedisPersistence (opts) {
     this._db = opts.conn || new Redis(opts)
   }
 
+  this._getRetainedChunkBound = this._getRetainedChunk.bind(this)
   CachedPersistence.call(this, opts)
 }
 
@@ -49,24 +52,18 @@ RedisPersistence.prototype.storeRetained = function (packet, cb) {
   }
 }
 
-RedisPersistence.prototype.createRetainedStreamCombi = function (patterns) {
-  const stream = throughv.obj(decodeRetainedPacket)
-  let c = 0
-  for (var i = 0; i < patterns.length; i++) {
-    this._db.hgetBuffer(retainedKey, patterns[i], (err, data) => {
-      if (err) {
-        stream.emit('error', err)
-      }
-      if (data !== null) {
-        stream.write(data)
-      }
-      if (++c === patterns.length) {
-        stream.end()
-      }
-    })
-  }
+RedisPersistence.prototype._getRetainedChunk = function (chunk, enc, cb) {
+  this._db.hgetBuffer(retainedKey, chunk, cb)
+}
 
-  return stream
+RedisPersistence.prototype.createRetainedStreamCombi = function (patterns) {
+  const patternsStream = Stream.Readable.from(patterns)
+
+  return pump(
+    patternsStream,
+    through.obj(this._getRetainedChunkBound),
+    throughv.obj(decodeRetainedPacket)
+  )
 }
 
 RedisPersistence.prototype.createRetainedStream = function (pattern) {
@@ -236,7 +233,7 @@ RedisPersistence.prototype.subscriptionsByTopic = function (topic, cb) {
   const subKey = subscribersKey + topic
   this._db.hgetall(subKey, function clientHash (err, data) {
     if (err) {
-      return cb(err)
+      return cb(err, null)
     }
     const result = Object.keys(data).map((k) => {
       return {
@@ -570,7 +567,7 @@ RedisPersistence.prototype.getClientList = function (topic) {
   var stream = new Stream()
   this._db.hgetall(subKey, function clientHash (err, data) {
     if (err) {
-      stream.emit(err)
+      stream.emit('error', err)
       return
     }
     var entries = Object.keys(data)
