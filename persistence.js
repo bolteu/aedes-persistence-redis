@@ -7,7 +7,7 @@ const pump = require('pump')
 const CachedPersistence = require('aedes-cached-persistence')
 const Packet = CachedPersistence.Packet
 const HLRU = require('hashlru')
-const { QlobberTrue } = require('qlobber')
+const { QlobberTrue, Qlobber } = require('qlobber')
 const qlobberOpts = {
   separator: '/',
   wildcard_one: '+',
@@ -23,6 +23,7 @@ const OUTGOINGKEY = 'outgoing:'
 const OUTGOINGIDKEY = 'outgoing-id:'
 const INCOMINGKEY = 'incoming:'
 const PACKETKEY = 'packet:'
+const SHAREDTOPICS = 'sharedtopics'
 
 function clientSubKey (clientId) {
   return `${CLIENTKEY}${encodeURIComponent(clientId)}`
@@ -495,6 +496,126 @@ class RedisPersistence extends CachedPersistence {
   getClientList (topic) {
     const entries = this._trie.match(topic, topic)
     return Readable.from(this.#getClientIdFromEntries(entries))
+  }
+
+  buildClientSharedTopic (group, clientId) {
+    return `$share/${group}/$client_${clientId}/`
+  }
+
+  parseSharedTopic (topic) {
+    if (!topic || !topic.startsWith('$share/')) return null
+
+    const groupEndIndx = topic.indexOf('/', 7)
+    if (groupEndIndx === -1) {
+      return null
+    }
+    const group = topic.substring(7, groupEndIndx)
+    const clientIndx = topic.indexOf('/$client_', groupEndIndx)
+    if (clientIndx === -1) {
+      return {
+        group,
+        client_id: null,
+        topic: topic.substring(8 + group.length)
+      }
+    }
+    const clientEndIndx = topic.indexOf('/', clientIndx + 9)
+    const clientId = topic.substring(clientIndx + 9, clientEndIndx)
+    const topicItself = topic.substring(clientEndIndx + 1, topic.length)
+
+    return {
+      group,
+      client_id: clientId,
+      topic: topicItself
+    }
+  }
+
+  storeSharedSubscription (topic, group, clientId, cb) {
+    const clientTopic = this.buildClientSharedTopic(group, clientId)
+    const groupTopic = group + '_' + topic
+    const pipeline = this._db.multi()
+    pipeline.sadd(SHAREDTOPICS, topic)
+    pipeline.sadd(topic, groupTopic)
+    pipeline.sadd(groupTopic, clientTopic)
+    pipeline.exec((err) => {
+      if (err) {
+        return cb(err)
+      }
+      cb(null, clientTopic + topic)
+    })
+  }
+
+  removeSharedSubscription (topic, group, clientId, cb) {
+    const clientTopic = this.buildClientSharedTopic(group, clientId)
+    const groupTopic = group + '_' + topic
+    const luaScript = `
+            local originalTopic = KEYS[1]
+            local groupTopic = KEYS[2]
+            local clientTopic = KEYS[3]
+            local sharedTopics = KEYS[4]
+            redis.call("srem", groupTopic, clientTopic)
+            local groupCardinality = redis.call("scard", groupTopic)
+            if groupCardinality == 0 then
+              redis.call("srem", originalTopic, groupTopic)
+              local topicCardinality = redis.call("scard", originalTopic)
+              if topicCardinality == 0 then
+                redis.call("srem", sharedTopics, originalTopic)
+              end
+            end
+        `
+    this._db.eval(luaScript, 4, [topic, groupTopic, clientTopic, SHAREDTOPICS], cb)
+  }
+
+  getSharedTopics (topic, cb) {
+    const luaScript = `
+        local inputTopics = ARGV
+        local originalTopic = KEYS[1]
+        local resultTopics = {}
+        for i=1, #inputTopics do
+            local groups = redis.call("smembers",inputTopics[i])
+            for j=1, #groups do
+                local clientTopic = redis.call("srandmember", groups[j])
+                table.insert(resultTopics, clientTopic .. originalTopic)
+            end
+        end
+
+        return resultTopics
+      `
+    const that = this
+    this._db.smembers(SHAREDTOPICS, function (err, sharedTopics) {
+      if (err) {
+        return cb(err)
+      }
+      if (!sharedTopics) {
+        return cb(null, [])
+      }
+      const qlobber = new Qlobber(qlobberOpts)
+      for (const topicFromResult of sharedTopics) {
+        qlobber.add(topicFromResult, topicFromResult)
+      }
+
+      const matches = qlobber.match(topic)
+      if (!matches) {
+        return cb(null, [])
+      }
+
+      that._db.eval(luaScript, 1, [topic, ...matches], function (err, clientTopics) {
+        if (err) {
+          return cb(err)
+        }
+
+        cb(null, clientTopics)
+      })
+    })
+  }
+
+  restoreOriginalTopicFromSharedOne (topic) {
+    if (topic.startsWith('$share/')) {
+      // extracting $share/client_id/group/ from topic
+      const originTopicIndex = topic.indexOf('/', topic.indexOf('/', 7) + 1)
+      return topic.substring(originTopicIndex + 1, topic.length)
+    }
+
+    return topic
   }
 
   _buildAugment (listKey) {

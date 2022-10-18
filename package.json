@@ -61,7 +61,7 @@
     "tape": "^5.5.3"
   },
   "dependencies": {
-    "aedes-cached-persistence": "^9.0.0",
+    "aedes-cached-persistence": "git+ssh://git@github.com:bolteu/aedes-cached-persistence.git#feature/RNTL-9614-shared-subscription-support",
     "hashlru": "^2.3.0",
     "ioredis": "^5.0.5",
     "msgpack-lite": "^0.1.26",
