@@ -609,8 +609,8 @@ class RedisPersistence extends CachedPersistence {
   }
 
   restoreOriginalTopicFromSharedOne (topic) {
-    if (topic.startsWith('$share/')) {
-      // extracting $share/client_id/group/ from topic
+    if (topic.startsWith('$share/') && topic.includes('/$client_')) {
+      // extracting $share/group/$client_client_id from topic
       const originTopicIndex = topic.indexOf('/', topic.indexOf('/', 7) + 1)
       return topic.substring(originTopicIndex + 1, topic.length)
     }
