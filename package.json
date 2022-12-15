@@ -1,6 +1,6 @@
 {
   "name": "aedes-persistence-redis",
-  "version": "9.0.2",
+  "version": "9.0.100",
   "description": "Aedes persistence, backed by redis",
   "main": "persistence.js",
   "publishConfig": {
@@ -46,7 +46,7 @@
     "tape": "^5.5.3"
   },
   "dependencies": {
-    "aedes-cached-persistence": "9.0.1",
+    "aedes-cached-persistence": "9.0.100",
     "hashlru": "^2.3.0",
     "ioredis": "^5.0.5",
     "msgpack-lite": "^0.1.26",
