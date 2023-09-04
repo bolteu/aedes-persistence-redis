@@ -304,6 +304,72 @@ test('wills table de-duplicate', t => {
   }
 })
 
+test('check storeShared been deleted after time', t => {
+  t.plan(10)
+  db.flushall()
+  const instance = persistence()
+  const emitter = mqemitterRedis()
+  instance.broker = toBroker('1', emitter)
+  const inputTopic = 'some/+/topic'
+  instance.storeSharedSubscription(inputTopic, 'someGroup', 'clientId', () => {
+    instance.storeSharedSubscription(inputTopic, 'someGroup', 'clientId2', () => {
+      db.zrange('sharedtowipe', 0, -1, (err, result) => {
+        t.notOk(err, 'zrange #1 no error')
+        t.equal(result[0], 'someGroup_some/+/topic@$share/someGroup/$client_clientId/')
+        t.equal(result[1], 'someGroup_some/+/topic@$share/someGroup/$client_clientId2/')
+        instance.getSharedTopics(inputTopic, (err2, topicResult1) => {
+          t.notOk(err2, 'getSharedTopics #1 no error')
+          db.zadd('sharedtowipe', (new Date() / 1000), 'someGroup_some/+/topic@$share/someGroup/$client_clientId/', () => {
+            setTimeout(() => {
+              db.zrange('sharedtowipe', 0, -1, (err3, result) => {
+                t.notOk(err3, 'zrange #2 no error')
+                t.equal(result.length, 1)
+                instance.getSharedTopics(inputTopic, (err4, topicResult2) => {
+                  t.notOk(err4, 'getSharedTopics #1 no error')
+                  t.equal(topicResult2[0], '$share/someGroup/$client_clientId2/some/+/topic')
+                  instance.destroy(t.pass.bind(t, 'instance dies'))
+                  emitter.close(t.pass.bind(t, 'stop emitter'))
+                })
+              })
+            }, 2 * 1000)
+          })
+        })
+      })
+    })
+  })
+})
+
+test('check storeShared return to redis after it was somehow deleted', t => {
+  t.plan(8)
+  db.flushall()
+  const instance = persistence()
+  const emitter = mqemitterRedis()
+  instance.broker = toBroker('1', emitter)
+  const inputTopic = 'some/+/topic'
+  instance.storeSharedSubscription(inputTopic, 'someGroup', 'clientId', () => {
+    instance.getSharedTopics(inputTopic, (err, topicResult1) => {
+      t.notOk(err, 'getSharedTopics #1 no error')
+      t.equal(topicResult1[0], '$share/someGroup/$client_clientId/some/+/topic')
+      // Deleting everything from DB
+      db.flushall()
+      instance.getSharedTopics(inputTopic, (err2, topicResult2) => {
+        t.notOk(err, 'getSharedTopics #2 no error')
+        // Should not have any topics
+        t.equal(topicResult2.length, 0)
+        // Should be restored in 10 seconds
+        setTimeout(() => {
+          instance.getSharedTopics(inputTopic, (err3, topicResult3) => {
+            t.notOk(err3, 'getSharedTopics #3 no error')
+            t.equal(topicResult3[0], '$share/someGroup/$client_clientId/some/+/topic')
+            instance.destroy(t.pass.bind(t, 'instance dies'))
+            emitter.close(t.pass.bind(t, 'stop emitter'))
+          })
+        }, 11 * 1000)
+      })
+    })
+  })
+})
+
 test.onFinish(() => {
   process.exit(0)
 })
