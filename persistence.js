@@ -24,6 +24,7 @@ const OUTGOINGIDKEY = 'outgoing-id:'
 const INCOMINGKEY = 'incoming:'
 const PACKETKEY = 'packet:'
 const SHAREDTOPICS = 'sharedtopics'
+const SHAREDTOWIPE = 'sharedtowipe'
 
 function clientSubKey (clientId) {
   return `${CLIENTKEY}${encodeURIComponent(clientId)}`
@@ -62,6 +63,7 @@ class RedisPersistence extends CachedPersistence {
     super(opts)
     this.maxSessionDelivery = opts.maxSessionDelivery || 1000
     this.packetTTL = opts.packetTTL || (() => { return 0 })
+    this.subscriptionTimers = {}
 
     this.messageIdCache = HLRU(100000)
 
@@ -536,9 +538,63 @@ class RedisPersistence extends CachedPersistence {
     pipeline.sadd(SHAREDTOPICS, topic)
     pipeline.sadd(topic, groupTopic)
     pipeline.sadd(groupTopic, clientTopic)
+    // Adding each shared topic to the list where it will be wiped if it will be not updated within 20 secs.
+    pipeline.zadd(SHAREDTOWIPE, (new Date() / 1000) + 20, `${groupTopic}@${clientTopic}`)
     pipeline.exec((err) => {
       if (err) {
         return cb(err)
+      }
+
+      if (!this.subscriptionTimers[clientId]) {
+        this.subscriptionTimers[clientId] = {}
+      }
+
+      if (this.subscriptionTimers[clientId] && !this.subscriptionTimers[clientId][groupTopic]) {
+        // Update all shared topics on Redis each 10 seconds.
+        // So if broker and client alive - topic will persist, if not - will be wiped
+        this.subscriptionTimers[clientId][groupTopic] = setInterval(() => {
+          this.storeSharedSubscription(topic, group, clientId, () => {})
+        }, 10 * 1000)
+      }
+
+      if (!this._cleanupOldShared) {
+        // Protection from leackage of shared subscriptions, in case if client is already dead but topic somehow
+        // left on the list
+        this._cleanupOldShared = setInterval(() => {
+          const luaScript = `
+            local sharedtowipe = KEYS[1]
+            local sharedTopics = KEYS[2]
+            local currentTime = tonumber(ARGV[1])
+            local deleted = {}
+            local elements = redis.call("zrangebyscore", sharedtowipe, "-inf", currentTime)
+            for _, element in ipairs(elements) do
+              local parts = {}
+              for str in string.gmatch(element, "([^@]+)") do
+                table.insert(parts, str)
+              end
+              local groupTopic, clientTopic = parts[1], parts[2]
+              local parts2 = {}
+              for str in string.gmatch(groupTopic, "([^_]+)") do
+                table.insert(parts2, str)
+              end
+              local originalTopic = parts2[2]
+              redis.call("srem", groupTopic, clientTopic)
+              redis.call("zrem", sharedtowipe, element)
+              table.insert(deleted, clientTopic)
+              local groupCardinality = redis.call("scard", groupTopic)
+              if groupCardinality == 0 then
+                redis.call("srem", originalTopic, groupTopic)
+                local topicCardinality = redis.call("scard", originalTopic)
+                if topicCardinality == 0 then
+                  redis.call("srem", sharedTopics, originalTopic)
+                end
+              end
+            end
+
+            return deleted
+          `
+          this._db.eval(luaScript, 2, [SHAREDTOWIPE, SHAREDTOPICS, (new Date() / 1000)], () => {})
+        }, 1 * 1000) // Each second check should we remove some outdated shared subscription or not
       }
       cb(null, clientTopic + topic)
     })
@@ -562,6 +618,12 @@ class RedisPersistence extends CachedPersistence {
               end
             end
         `
+    // Remove restoration interval at first
+    if (this.subscriptionTimers[clientId] && this.subscriptionTimers[clientId][groupTopic]) {
+      clearInterval(this.subscriptionTimers[clientId][groupTopic])
+      delete this.subscriptionTimers[clientId][groupTopic]
+    }
+
     this._db.eval(luaScript, 4, [topic, groupTopic, clientTopic, SHAREDTOPICS], cb)
   }
 
@@ -636,6 +698,18 @@ class RedisPersistence extends CachedPersistence {
 
   destroy (cb) {
     const that = this
+    if (this._cleanupOldShared) {
+      clearInterval(this._cleanupOldShared)
+    }
+
+    for (const clientId in this.subscriptionTimers) {
+      for (const groupTopic in this.subscriptionTimers[clientId]) {
+        clearInterval(this.subscriptionTimers[clientId][groupTopic])
+        delete this.subscriptionTimers[clientId][groupTopic]
+      }
+      delete this.subscriptionTimers[clientId]
+    }
+
     CachedPersistence.prototype.destroy.call(this, function disconnect () {
       that._db.disconnect()
 
