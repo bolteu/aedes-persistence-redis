@@ -53,7 +53,7 @@ abs({
   },
   persistence () {
     db.flushall()
-    return persistence()
+    return persistence({ shared_cache_refresh_interval_sec: 10 })
   },
   waitForReady: true
 })
@@ -304,7 +304,7 @@ test('wills table de-duplicate', t => {
   }
 })
 
-test('check storeShared been deleted after time', t => {
+test('check storeShared was deleted after time', t => {
   t.plan(10)
   db.flushall()
   const instance = persistence()
@@ -319,7 +319,7 @@ test('check storeShared been deleted after time', t => {
         t.equal(result[1], 'someGroup_some/+/topic@$share/someGroup/$client_clientId2/')
         instance.getSharedTopics(inputTopic, (err2, topicResult1) => {
           t.notOk(err2, 'getSharedTopics #1 no error')
-          db.zadd('sharedtowipe', (new Date() / 1000), 'someGroup_some/+/topic@$share/someGroup/$client_clientId/', () => {
+          db.zadd('sharedtowipe', (Date.now() / 1000), 'someGroup_some/+/topic@$share/someGroup/$client_clientId/', () => {
             setTimeout(() => {
               db.zrange('sharedtowipe', 0, -1, (err3, result) => {
                 t.notOk(err3, 'zrange #2 no error')

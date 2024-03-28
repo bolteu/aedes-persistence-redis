@@ -10,7 +10,7 @@ const st = Date.now()
 console.log('Started connecting clients', st)
 
 setInterval(() => {
-  console.log(`${new Date()}-${count} - ${subscriptions}`)
+  console.log(`${Date.now()}-${count} - ${subscriptions}`)
 }, 1000)
 
 function worker (arg, cb) {
