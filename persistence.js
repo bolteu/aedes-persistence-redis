@@ -64,6 +64,14 @@ class RedisPersistence extends CachedPersistence {
     this.maxSessionDelivery = opts.maxSessionDelivery || 1000
     this.packetTTL = opts.packetTTL || (() => { return 0 })
     this.subscriptionTimers = {}
+    this.lastCacheRefreshTs = 0
+    this.sharedCacheRefreshIntervalSec = opts.shared_cache_refresh_interval_sec
+    this.cachedSharedTopics = new Set()
+    this.sharedCachedQlobber = new Qlobber(qlobberOpts)
+    // Map ( topic -> Set( groups ))
+    this.cachedSharedTopicsToGroups = new Map()
+    // Map ( group -> Set( client_id_topic ))
+    this.cachedSharedGroupsClientTopics = new Map()
 
     this.messageIdCache = HLRU(100000)
 
@@ -539,7 +547,7 @@ class RedisPersistence extends CachedPersistence {
     pipeline.sadd(topic, groupTopic)
     pipeline.sadd(groupTopic, clientTopic)
     // Adding each shared topic to the list where it will be wiped if it will be not updated within 20 secs.
-    pipeline.zadd(SHAREDTOWIPE, (new Date() / 1000) + 20, `${groupTopic}@${clientTopic}`)
+    pipeline.zadd(SHAREDTOWIPE, (Date.now() / 1000) + 20, `${groupTopic}@${clientTopic}`)
     pipeline.exec((err) => {
       if (err) {
         return cb(err)
@@ -593,14 +601,36 @@ class RedisPersistence extends CachedPersistence {
 
             return deleted
           `
-          this._db.eval(luaScript, 2, [SHAREDTOWIPE, SHAREDTOPICS, (new Date() / 1000)], () => {})
+          this._db.eval(luaScript, 2, [SHAREDTOWIPE, SHAREDTOPICS, (Date.now() / 1000)], () => {})
         }, 1 * 1000) // Each second check should we remove some outdated shared subscription or not
       }
       cb(null, clientTopic + topic)
     })
   }
 
+  removeSharedSubscriptionFromCache (topic, group, clientId) {
+    const groupTopicKey = group + '_' + topic
+    const clientTopic = this.buildClientSharedTopic(group, clientId)
+    const groupClients = this.cachedSharedGroupsClientTopics.get(groupTopicKey)
+    if (groupClients && groupClients.size !== 0) {
+      groupClients.delete(clientTopic)
+      if (groupClients.size === 0) {
+        const groupsToTopics = this.cachedSharedTopicsToGroups.get(topic)
+        if (groupsToTopics && groupsToTopics.size !== 0) {
+          groupsToTopics.delete(groupTopicKey)
+          if (groupsToTopics.size === 0) {
+            this.cachedSharedTopics.delete(topic)
+            this.sharedCachedQlobber.remove(topic)
+          }
+        }
+      }
+    }
+  }
+
   removeSharedSubscription (topic, group, clientId, cb) {
+    if (this.sharedCacheRefreshIntervalSec) {
+      this.removeSharedSubscriptionFromCache(topic, group, clientId)
+    }
     const clientTopic = this.buildClientSharedTopic(group, clientId)
     const groupTopic = group + '_' + topic
     const luaScript = `
@@ -627,8 +657,94 @@ class RedisPersistence extends CachedPersistence {
     this._db.eval(luaScript, 4, [topic, groupTopic, clientTopic, SHAREDTOPICS], cb)
   }
 
+  fillSharedCache (cb) {
+    const that = this
+    that._db.smembers(SHAREDTOPICS, function (err, sharedTopics) {
+      if (err) {
+        return cb(err)
+      }
+      if (!sharedTopics) {
+        return cb(null)
+      }
+
+      that.sharedCachedQlobber = new Qlobber(qlobberOpts)
+      that.cachedSharedTopics = new Set(sharedTopics)
+      const pipeline = that._db.pipeline()
+      sharedTopics.forEach((topicFromResult) => {
+        that.sharedCachedQlobber.add(topicFromResult, topicFromResult)
+        pipeline.smembers(topicFromResult)
+      })
+
+      // Execute pipeline
+      const allClientTopics = []
+      pipeline.exec((err, replies) => {
+        if (err) {
+          cb(err)
+        } else {
+          // Map replies to topics
+          that.cachedSharedTopicsToGroups = new Map()
+          replies.forEach((reply, index) => {
+            if (reply[1] && reply[1].length > 0) {
+              const topic = sharedTopics[index]
+              that.cachedSharedTopicsToGroups.set(topic, new Set(reply[1]))
+              reply[1].forEach((clientTopic) => {
+                allClientTopics.push(clientTopic)
+              })
+            }
+          })
+          const pipelineForGroups = that._db.pipeline()
+          allClientTopics.forEach((item) => {
+            pipelineForGroups.smembers(item)
+          })
+          pipelineForGroups.exec((err, groupsReplies) => {
+            if (err) {
+              cb(err)
+            } else {
+              // Map replies to topics
+              that.cachedSharedGroupsClientTopics = new Map()
+              groupsReplies.forEach((reply, index) => {
+                that.cachedSharedGroupsClientTopics.set(allClientTopics[index], new Set(reply[1]))
+              })
+
+              that.lastCacheRefreshTs = (Date.now() / 1000)
+              cb(null)
+            }
+          })
+        }
+      })
+    })
+  }
+
+  getSharedTopicsFromCache (topic, cb) {
+    const resultTopics = []
+    const matches = this.sharedCachedQlobber.match(topic)
+    for (const match of matches) {
+      if (this.cachedSharedTopics.has(match)) {
+        const groups = this.cachedSharedTopicsToGroups.get(match)
+        for (const group of groups) {
+          const clientTopics = Array.from(this.cachedSharedGroupsClientTopics.get(group))
+          const randomTopic = clientTopics[Math.floor(Math.random() * clientTopics.length)]
+          resultTopics.push(randomTopic + topic)
+        }
+      }
+    }
+    cb(null, resultTopics)
+  }
+
   getSharedTopics (topic, cb) {
-    const luaScript = `
+    if (this.sharedCacheRefreshIntervalSec) {
+      if (this.lastCacheRefreshTs + this.sharedCacheRefreshIntervalSec < (Date.now() / 1000)) {
+        this.fillSharedCache((err) => {
+          if (err) {
+            cb(err)
+          }
+          this.getSharedTopicsFromCache(topic, cb)
+        })
+      } else {
+        this.getSharedTopicsFromCache(topic, cb)
+      }
+    } else {
+      const luaScript = `
         local inputTopics = ARGV
         local originalTopic = KEYS[1]
         local resultTopics = {}
@@ -642,32 +758,33 @@ class RedisPersistence extends CachedPersistence {
 
         return resultTopics
       `
-    const that = this
-    this._db.smembers(SHAREDTOPICS, function (err, sharedTopics) {
-      if (err) {
-        return cb(err)
-      }
-      if (!sharedTopics) {
-        return cb(null, [])
-      }
-      const qlobber = new Qlobber(qlobberOpts)
-      for (const topicFromResult of sharedTopics) {
-        qlobber.add(topicFromResult, topicFromResult)
-      }
-
-      const matches = qlobber.match(topic)
-      if (!matches) {
-        return cb(null, [])
-      }
-
-      that._db.eval(luaScript, 1, [topic, ...matches], function (err, clientTopics) {
+      const that = this
+      this._db.smembers(SHAREDTOPICS, function (err, sharedTopics) {
         if (err) {
           return cb(err)
         }
+        if (!sharedTopics) {
+          return cb(null, [])
+        }
+        const qlobber = new Qlobber(qlobberOpts)
+        for (const topicFromResult of sharedTopics) {
+          qlobber.add(topicFromResult, topicFromResult)
+        }
 
-        cb(null, clientTopics)
+        const matches = qlobber.match(topic)
+        if (!matches) {
+          return cb(null, [])
+        }
+
+        that._db.eval(luaScript, 1, [topic, ...matches], function (err, clientTopics) {
+          if (err) {
+            return cb(err)
+          }
+
+          cb(null, clientTopics)
+        })
       })
-    })
+    }
   }
 
   restoreOriginalTopicFromSharedOne (topic) {
