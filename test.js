@@ -319,70 +319,74 @@ test('wills table de-duplicate', async t => {
   await executeTest
 })
 
-test('check storeShared was deleted after time', t => {
-  t.plan(10)
-  db.flushall()
-  const instance = persistence()
-  const emitter = mqemitterRedis()
-  instance.broker = toBroker('1', emitter)
-  const inputTopic = 'some/+/topic'
-  instance.storeSharedSubscription(inputTopic, 'someGroup', 'clientId', () => {
-    instance.storeSharedSubscription(inputTopic, 'someGroup', 'clientId2', () => {
-      db.zrange('sharedtowipe', 0, -1, (err, result) => {
-        t.notOk(err, 'zrange #1 no error')
-        t.equal(result[0], 'someGroup_some/+/topic@$share/someGroup/$client_clientId/')
-        t.equal(result[1], 'someGroup_some/+/topic@$share/someGroup/$client_clientId2/')
-        instance.getSharedTopics(inputTopic, (err2, topicResult1) => {
-          t.notOk(err2, 'getSharedTopics #1 no error')
-          db.zadd('sharedtowipe', (Date.now() / 1000), 'someGroup_some/+/topic@$share/someGroup/$client_clientId/', () => {
-            setTimeout(() => {
-              db.zrange('sharedtowipe', 0, -1, (err3, result) => {
-                t.notOk(err3, 'zrange #2 no error')
-                t.equal(result.length, 1)
-                instance.getSharedTopics(inputTopic, (err4, topicResult2) => {
-                  t.notOk(err4, 'getSharedTopics #1 no error')
-                  t.equal(topicResult2[0], '$share/someGroup/$client_clientId2/some/+/topic')
-                  instance.destroy(t.pass.bind(t, 'instance dies'))
-                  emitter.close(t.pass.bind(t, 'stop emitter'))
+test('check storeShared was deleted after time', async t => {
+  t.plan(8)
+  const executeTest = new Promise((resolve, reject) => {
+    db.flushall()
+    const p = setUpPersistence(t, '1')
+    const instance = p.instance
+    const inputTopic = 'some/+/topic'
+    instance.storeSharedSubscription(inputTopic, 'someGroup', 'clientId', () => {
+      instance.storeSharedSubscription(inputTopic, 'someGroup', 'clientId2', () => {
+        db.zrange('sharedtowipe', 0, -1, (err, result) => {
+          t.assert.ok(!err, 'zrange #1 no error')
+          t.assert.equal(result[0], 'someGroup_some/+/topic@$share/someGroup/$client_clientId/')
+          t.assert.equal(result[1], 'someGroup_some/+/topic@$share/someGroup/$client_clientId2/')
+          instance.getSharedTopics(inputTopic, (err2, topicResult1) => {
+            t.assert.ok(!err2, 'getSharedTopics #1 no error')
+            db.zadd('sharedtowipe', (Date.now() / 1000), 'someGroup_some/+/topic@$share/someGroup/$client_clientId/', () => {
+              setTimeout(() => {
+                db.zrange('sharedtowipe', 0, -1, (err3, result) => {
+                  t.assert.ok(!err3, 'zrange #2 no error')
+                  t.assert.equal(result.length, 1)
+                  instance.getSharedTopics(inputTopic, (err4, topicResult2) => {
+                    t.assert.ok(!err4, 'getSharedTopics #1 no error')
+                    t.assert.equal(topicResult2[0], '$share/someGroup/$client_clientId2/some/+/topic')
+                    cleanUpPersistence(t, p)
+                    resolve()
+                  })
                 })
-              })
-            }, 2 * 1000)
+              }, 2 * 1000)
+            })
           })
-      })
+        })
       })
     })
   })
+  await executeTest
 })
 
-test('check storeShared return to redis after it was somehow deleted', t => {
-  t.plan(8)
-  db.flushall()
-  const instance = persistence()
-  const emitter = mqemitterRedis()
-  instance.broker = toBroker('1', emitter)
-  const inputTopic = 'some/+/topic'
-  instance.storeSharedSubscription(inputTopic, 'someGroup', 'clientId', () => {
-    instance.getSharedTopics(inputTopic, (err, topicResult1) => {
-      t.notOk(err, 'getSharedTopics #1 no error')
-      t.equal(topicResult1[0], '$share/someGroup/$client_clientId/some/+/topic')
-      // Deleting everything from DB
-      db.flushall()
-      instance.getSharedTopics(inputTopic, (err2, topicResult2) => {
-        t.notOk(err, 'getSharedTopics #2 no error')
-        // Should not have any topics
-        t.equal(topicResult2.length, 0)
-        // Should be restored in 10 seconds
-        setTimeout(() => {
-          instance.getSharedTopics(inputTopic, (err3, topicResult3) => {
-            t.notOk(err3, 'getSharedTopics #3 no error')
-            t.equal(topicResult3[0], '$share/someGroup/$client_clientId/some/+/topic')
-            instance.destroy(t.pass.bind(t, 'instance dies'))
-            emitter.close(t.pass.bind(t, 'stop emitter'))
-          })
-        }, 11 * 1000)
+test('check storeShared return to redis after it was somehow deleted', async t => {
+  t.plan(6)
+  const executeTest = new Promise((resolve, reject) => {
+    db.flushall()
+    const p = setUpPersistence(t, '1')
+    const instance = p.instance
+    const inputTopic = 'some/+/topic'
+    instance.storeSharedSubscription(inputTopic, 'someGroup', 'clientId', () => {
+      instance.getSharedTopics(inputTopic, (err, topicResult1) => {
+        t.assert.ok(!err, 'getSharedTopics #1 no error')
+        t.assert.equal(topicResult1[0], '$share/someGroup/$client_clientId/some/+/topic')
+        // Deleting everything from DB
+        db.flushall()
+        instance.getSharedTopics(inputTopic, (err2, topicResult2) => {
+          t.assert.ok(!err, 'getSharedTopics #2 no error')
+          // Should not have any topics
+          t.assert.equal(topicResult2.length, 0)
+          // Should be restored in 10 seconds
+          setTimeout(() => {
+            instance.getSharedTopics(inputTopic, (err3, topicResult3) => {
+              t.assert.ok(!err3, 'getSharedTopics #3 no error')
+              t.assert.equal(topicResult3[0], '$share/someGroup/$client_clientId/some/+/topic')
+              cleanUpPersistence(t, p)
+              resolve()
+            })
+          }, 11 * 1000)
+        })
       })
     })
   })
+  await executeTest
 })
 
 // clients will keep on running after the test
