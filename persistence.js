@@ -98,6 +98,12 @@ async function * createWillStream (db, brokers, maxWills) {
   }
 }
 
+class NoopLogger {
+  info (message, meta) {}
+  warning (message, meta) {}
+  error (message, meta) {}
+}
+
 class RedisPersistence extends CachedPersistence {
   constructor (opts = {}) {
     super(opts)
@@ -105,9 +111,8 @@ class RedisPersistence extends CachedPersistence {
     this.maxWills = 10000
     this.packetTTL = opts.packetTTL || (() => { return 0 })
     this.subscriptionTimers = {}
-    this.lastCacheRefreshTs = 0
     this.sharedCacheRefreshIntervalSec = opts.shared_cache_refresh_interval_sec
-    this.cachedSharedTopics = new Set()
+    this.sharedSubscriptionRestoreIntervalSec = opts.shared_subscription_restore_interval_sec || 10
     this.sharedCachedQlobber = new Qlobber(qlobberOpts)
     // Map ( topic -> Set( groups ))
     this.cachedSharedTopicsToGroups = new Map()
@@ -123,6 +128,32 @@ class RedisPersistence extends CachedPersistence {
     }
 
     this.hasClusters = !!opts.cluster
+
+    this.logger = opts.logger || new NoopLogger()
+
+    if (this.sharedCacheRefreshIntervalSec) {
+      this.once('ready', () => {
+        setInterval(() => {
+          const start = Date.now()
+          this.fillSharedCache((err) => {
+            if (err) {
+              this.logger.warning('Error while updating shared cache', {
+                topics: this.cachedSharedTopicsToGroups.size,
+                groups: this.cachedSharedGroupsClientTopics.size,
+                duration_ms: Date.now() - start,
+                error: err
+              })
+            } else {
+              this.logger.info('Shared cache filled', {
+                topics: this.cachedSharedTopicsToGroups.size,
+                groups: this.cachedSharedGroupsClientTopics.size,
+                duration_ms: Date.now() - start
+              })
+            }
+          })
+        }, this.sharedCacheRefreshIntervalSec * 1000)
+      })
+    }
   }
 
   /**
@@ -567,7 +598,37 @@ class RedisPersistence extends CachedPersistence {
     }
   }
 
+  clearSharedSubscriptionCache () {
+    this.sharedCachedQlobber = new Qlobber(qlobberOpts)
+    this.cachedSharedTopicsToGroups = new Map()
+    this.cachedSharedGroupsClientTopics = new Map()
+  }
+
+  storeSharedSubscriptionToCache (topic, group, clientId) {
+    const groupTopic = group + '_' + topic
+    const clientTopic = this.buildClientSharedTopic(group, clientId)
+
+    this.sharedCachedQlobber.add(topic, topic)
+
+    const groupsToTopics = this.cachedSharedTopicsToGroups.get(topic)
+    if (groupsToTopics) {
+      groupsToTopics.add(groupTopic)
+    } else {
+      this.cachedSharedTopicsToGroups.set(topic, new Set([groupTopic]))
+    }
+
+    const groupClients = this.cachedSharedGroupsClientTopics.get(groupTopic)
+    if (groupClients) {
+      groupClients.add(clientTopic)
+    } else {
+      this.cachedSharedGroupsClientTopics.set(groupTopic, new Set([clientTopic]))
+    }
+  }
+
   storeSharedSubscription (topic, group, clientId, cb) {
+    if (this.sharedCacheRefreshIntervalSec) {
+      this.storeSharedSubscriptionToCache(topic, group, clientId)
+    }
     const clientTopic = this.buildClientSharedTopic(group, clientId)
     const groupTopic = group + '_' + topic
     const pipeline = this._db.multi()
@@ -590,7 +651,7 @@ class RedisPersistence extends CachedPersistence {
         // So if broker and client alive - topic will persist, if not - will be wiped
         this.subscriptionTimers[clientId][groupTopic] = setInterval(() => {
           this.storeSharedSubscription(topic, group, clientId, () => {})
-        }, 10 * 1000)
+        }, this.sharedSubscriptionRestoreIntervalSec * 1000)
       }
 
       if (!this._cleanupOldShared) {
@@ -637,17 +698,16 @@ class RedisPersistence extends CachedPersistence {
   }
 
   removeSharedSubscriptionFromCache (topic, group, clientId) {
-    const groupTopicKey = group + '_' + topic
+    const groupTopic = group + '_' + topic
     const clientTopic = this.buildClientSharedTopic(group, clientId)
-    const groupClients = this.cachedSharedGroupsClientTopics.get(groupTopicKey)
+    const groupClients = this.cachedSharedGroupsClientTopics.get(groupTopic)
     if (groupClients && groupClients.size !== 0) {
       groupClients.delete(clientTopic)
       if (groupClients.size === 0) {
         const groupsToTopics = this.cachedSharedTopicsToGroups.get(topic)
         if (groupsToTopics && groupsToTopics.size !== 0) {
-          groupsToTopics.delete(groupTopicKey)
+          groupsToTopics.delete(groupTopic)
           if (groupsToTopics.size === 0) {
-            this.cachedSharedTopics.delete(topic)
             this.sharedCachedQlobber.remove(topic)
           }
         }
@@ -695,46 +755,50 @@ class RedisPersistence extends CachedPersistence {
         return cb(null)
       }
 
-      that.sharedCachedQlobber = new Qlobber(qlobberOpts)
-      that.cachedSharedTopics = new Set(sharedTopics)
+      const newSharedCachedQlobber = new Qlobber(qlobberOpts)
+      const newCachedSharedTopicsToGroups = new Map()
+
       const pipeline = that._db.pipeline()
       sharedTopics.forEach((topicFromResult) => {
-        that.sharedCachedQlobber.add(topicFromResult, topicFromResult)
+        newSharedCachedQlobber.add(topicFromResult, topicFromResult)
         pipeline.smembers(topicFromResult)
       })
 
       // Execute pipeline
-      const allClientTopics = []
+      const allGroupTopics = []
       pipeline.exec((err, replies) => {
         if (err) {
           cb(err)
         } else {
           // Map replies to topics
-          that.cachedSharedTopicsToGroups = new Map()
           replies.forEach((reply, index) => {
             if (reply[1] && reply[1].length > 0) {
               const topic = sharedTopics[index]
-              that.cachedSharedTopicsToGroups.set(topic, new Set(reply[1]))
+              newCachedSharedTopicsToGroups.set(topic, new Set(reply[1]))
               reply[1].forEach((clientTopic) => {
-                allClientTopics.push(clientTopic)
+                allGroupTopics.push(clientTopic)
               })
             }
           })
           const pipelineForGroups = that._db.pipeline()
-          allClientTopics.forEach((item) => {
+          allGroupTopics.forEach((item) => {
             pipelineForGroups.smembers(item)
           })
           pipelineForGroups.exec((err, groupsReplies) => {
             if (err) {
               cb(err)
             } else {
-              // Map replies to topics
+              // Updating shared state only in the very end to make it visible to getSharedTopicsFromCache.
+              // Otherwise it could observe inconsistent state.
+              that.sharedCachedQlobber = newSharedCachedQlobber
+              that.cachedSharedTopicsToGroups = newCachedSharedTopicsToGroups
               that.cachedSharedGroupsClientTopics = new Map()
               groupsReplies.forEach((reply, index) => {
-                that.cachedSharedGroupsClientTopics.set(allClientTopics[index], new Set(reply[1]))
+                const groupTopic = allGroupTopics[index]
+                const clientTopics = reply[1]
+                that.cachedSharedGroupsClientTopics.set(groupTopic, new Set(clientTopics))
               })
 
-              that.lastCacheRefreshTs = (Date.now() / 1000)
               cb(null)
             }
           })
@@ -747,13 +811,11 @@ class RedisPersistence extends CachedPersistence {
     const resultTopics = []
     const matches = this.sharedCachedQlobber.match(topic)
     for (const match of matches) {
-      if (this.cachedSharedTopics.has(match)) {
-        const groups = this.cachedSharedTopicsToGroups.get(match)
-        for (const group of groups) {
-          const clientTopics = Array.from(this.cachedSharedGroupsClientTopics.get(group))
-          const randomTopic = clientTopics[Math.floor(Math.random() * clientTopics.length)]
-          resultTopics.push(randomTopic + topic)
-        }
+      const groups = this.cachedSharedTopicsToGroups.get(match) ?? []
+      for (const group of groups) {
+        const clientTopics = Array.from(this.cachedSharedGroupsClientTopics.get(group))
+        const randomTopic = clientTopics[Math.floor(Math.random() * clientTopics.length)]
+        resultTopics.push(randomTopic + topic)
       }
     }
     cb(null, resultTopics)
@@ -761,16 +823,7 @@ class RedisPersistence extends CachedPersistence {
 
   getSharedTopics (topic, cb) {
     if (this.sharedCacheRefreshIntervalSec) {
-      if (this.lastCacheRefreshTs + this.sharedCacheRefreshIntervalSec < (Date.now() / 1000)) {
-        this.fillSharedCache((err) => {
-          if (err) {
-            cb(err)
-          }
-          this.getSharedTopicsFromCache(topic, cb)
-        })
-      } else {
-        this.getSharedTopicsFromCache(topic, cb)
-      }
+      this.getSharedTopicsFromCache(topic, cb)
     } else {
       const luaScript = `
         local inputTopics = ARGV

@@ -356,11 +356,28 @@ test('check storeShared was deleted after time', async t => {
   await executeTest
 })
 
+class TestLogger {
+  info (message, meta) {
+    console.info(message, meta)
+  }
+
+  warning (message, meta) {
+    console.warn(message, meta)
+  }
+
+  error (message, meta) {
+    console.error(message, meta)
+  }
+}
+
 test('check storeShared return to redis after it was somehow deleted', async t => {
   t.plan(6)
   const executeTest = new Promise((resolve, reject) => {
     db.flushall()
-    const p = setUpPersistence(t, '1')
+    const p = setUpPersistence(t, '1', {
+      shared_subscription_restore_interval_sec: 1,
+      logger: new TestLogger()
+    })
     const instance = p.instance
     const inputTopic = 'some/+/topic'
     instance.storeSharedSubscription(inputTopic, 'someGroup', 'clientId', () => {
@@ -370,10 +387,10 @@ test('check storeShared return to redis after it was somehow deleted', async t =
         // Deleting everything from DB
         db.flushall()
         instance.getSharedTopics(inputTopic, (err2, topicResult2) => {
-          t.assert.ok(!err, 'getSharedTopics #2 no error')
+          t.assert.ok(!err2, 'getSharedTopics #2 no error')
           // Should not have any topics
           t.assert.equal(topicResult2.length, 0)
-          // Should be restored in 10 seconds
+          // Should be restored in 2 seconds
           setTimeout(() => {
             instance.getSharedTopics(inputTopic, (err3, topicResult3) => {
               t.assert.ok(!err3, 'getSharedTopics #3 no error')
@@ -381,7 +398,7 @@ test('check storeShared return to redis after it was somehow deleted', async t =
               cleanUpPersistence(t, p)
               resolve()
             })
-          }, 11 * 1000)
+          }, 2 * 1000)
         })
       })
     })
@@ -389,5 +406,41 @@ test('check storeShared return to redis after it was somehow deleted', async t =
   await executeTest
 })
 
+test('getSharedTopics read from cache', async t => {
+  t.plan(6)
+  const executeTest = new Promise((resolve, reject) => {
+    db.flushall()
+    const p = setUpPersistence(t, '1', {
+      shared_cache_refresh_interval_sec: 1,
+      logger: new TestLogger()
+    })
+    const instance = p.instance
+    const inputTopic = 'some/+/topic'
+    instance.storeSharedSubscription(inputTopic, 'someGroup', 'clientId', () => {
+      instance.getSharedTopics(inputTopic, (err, topicResult1) => {
+        t.assert.ok(!err, 'getSharedTopics #1 no error')
+        t.assert.deepEqual(topicResult1, ['$share/someGroup/$client_clientId/some/+/topic'])
+      })
+
+      instance.clearSharedSubscriptionCache()
+
+      instance.getSharedTopics(inputTopic, (err2, topicResult2) => {
+        t.assert.ok(!err2, 'getSharedTopics #2 no error')
+        t.assert.deepEqual(topicResult2, [])
+      })
+
+      setTimeout(() => {
+        instance.getSharedTopics(inputTopic, (err3, topicResult3) => {
+          t.assert.ok(!err3, 'getSharedTopics #3 no error')
+          t.assert.deepEqual(topicResult3, ['$share/someGroup/$client_clientId/some/+/topic'])
+          cleanUpPersistence(t, p)
+          resolve()
+        })
+      }, 1500)
+    })
+  })
+  await executeTest
+})
+
 // clients will keep on running after the test
-sleep(10).then(() => process.exit(0))
+sleep(20).then(() => process.exit(0))
