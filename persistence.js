@@ -1,9 +1,6 @@
 const Redis = require('ioredis')
-const { Readable } = require('stream')
-const through = require('through2')
-const throughv = require('throughv')
+const { Readable } = require('node:stream')
 const msgpack = require('msgpack-lite')
-const pump = require('pump')
 const CachedPersistence = require('aedes-cached-persistence')
 const Packet = CachedPersistence.Packet
 const HLRU = require('hashlru')
@@ -19,6 +16,7 @@ const CLIENTSKEY = 'clients'
 const WILLSKEY = 'will'
 const WILLKEY = 'will:'
 const RETAINEDKEY = 'retained'
+const ALL_RETAINEDKEYS = `${RETAINEDKEY}:*`
 const OUTGOINGKEY = 'outgoing:'
 const OUTGOINGIDKEY = 'outgoing-id:'
 const INCOMINGKEY = 'incoming:'
@@ -54,19 +52,67 @@ function packetKey (brokerId, brokerCounter) {
   return `${PACKETKEY}${brokerId}:${brokerCounter}`
 }
 
+function retainedKey (topic) {
+  return `${RETAINEDKEY}:${encodeURIComponent(topic)}`
+}
+
 function packetCountKey (brokerId, brokerCounter) {
   return `${PACKETKEY}${brokerId}:${brokerCounter}:offlineCount`
+}
+
+async function getDecodedValue (db, listKey, key) {
+  const value = await db.getBuffer(key)
+  const decoded = value ? msgpack.decode(value) : undefined
+  if (!decoded) {
+    db.lrem(listKey, 0, key)
+  }
+  return decoded
+}
+
+async function getRetainedKeys (db, hasClusters) {
+  if (hasClusters === true) {
+    // Get keys of all the masters
+    const masters = db.nodes('master')
+    const keys = await Promise.all(
+      masters.flatMap((node) => node.keys(ALL_RETAINEDKEYS))
+    )
+    return keys
+  }
+  return await db.hkeys(RETAINEDKEY)
+}
+
+async function getRetainedValue (db, topic, hasClusters) {
+  if (hasClusters === true) {
+    return msgpack.decode(await db.getBuffer(retainedKey(topic)))
+  }
+  return msgpack.decode(await db.hgetBuffer(RETAINEDKEY, topic))
+}
+
+async function * createWillStream (db, brokers, maxWills) {
+  const results = await db.lrange(WILLSKEY, 0, maxWills)
+  for (const key of results) {
+    const result = await getDecodedValue(db, WILLSKEY, key)
+    if (!brokers || !brokers[key.split(':')[1]]) {
+      yield result
+    }
+  }
+}
+
+class NoopLogger {
+  info (message, meta) {}
+  warning (message, meta) {}
+  error (message, meta) {}
 }
 
 class RedisPersistence extends CachedPersistence {
   constructor (opts = {}) {
     super(opts)
     this.maxSessionDelivery = opts.maxSessionDelivery || 1000
+    this.maxWills = 10000
     this.packetTTL = opts.packetTTL || (() => { return 0 })
     this.subscriptionTimers = {}
-    this.lastCacheRefreshTs = 0
     this.sharedCacheRefreshIntervalSec = opts.shared_cache_refresh_interval_sec
-    this.cachedSharedTopics = new Set()
+    this.sharedSubscriptionRestoreIntervalSec = opts.shared_subscription_restore_interval_sec || 10
     this.sharedCachedQlobber = new Qlobber(qlobberOpts)
     // Map ( topic -> Set( groups ))
     this.cachedSharedTopicsToGroups = new Map()
@@ -75,16 +121,54 @@ class RedisPersistence extends CachedPersistence {
 
     this.messageIdCache = HLRU(100000)
 
-    if (opts.cluster) {
+    if (opts.cluster && Array.isArray(opts.cluster)) {
       this._db = new Redis.Cluster(opts.cluster)
     } else {
       this._db = opts.conn || new Redis(opts)
     }
 
-    this._getRetainedChunkBound = this._getRetainedChunk.bind(this)
+    this.hasClusters = !!opts.cluster
+
+    this.logger = opts.logger || new NoopLogger()
+
+    if (this.sharedCacheRefreshIntervalSec) {
+      this.once('ready', () => {
+        setInterval(() => {
+          const start = Date.now()
+          this.fillSharedCache((err) => {
+            if (err) {
+              this.logger.warning('Error while updating shared cache', {
+                topics: this.cachedSharedTopicsToGroups.size,
+                groups: this.cachedSharedGroupsClientTopics.size,
+                duration_ms: Date.now() - start,
+                error: err
+              })
+            } else {
+              this.logger.info('Shared cache filled', {
+                topics: this.cachedSharedTopicsToGroups.size,
+                groups: this.cachedSharedGroupsClientTopics.size,
+                duration_ms: Date.now() - start
+              })
+            }
+          })
+        }, this.sharedCacheRefreshIntervalSec * 1000)
+      })
+    }
   }
 
-  storeRetained (packet, cb) {
+  /**
+   * When using clusters we store it using a compound key instead of an hash
+   * to spread the load across the clusters. See issue #85.
+   */
+  _storeRetainedCluster (packet, cb) {
+    if (packet.payload.length === 0) {
+      this._db.del(retainedKey(packet.topic), cb)
+    } else {
+      this._db.set(retainedKey(packet.topic), msgpack.encode(packet), cb)
+    }
+  }
+
+  _storeRetained (packet, cb) {
     if (packet.payload.length === 0) {
       this._db.hdel(RETAINEDKEY, packet.topic, cb)
     } else {
@@ -92,29 +176,22 @@ class RedisPersistence extends CachedPersistence {
     }
   }
 
-  _getRetainedChunk (chunk, enc, cb) {
-    this._db.hgetBuffer(RETAINEDKEY, chunk, cb)
+  storeRetained (packet, cb) {
+    if (this.hasClusters) {
+      this._storeRetainedCluster(packet, cb)
+    } else {
+      this._storeRetained(packet, cb)
+    }
   }
 
   createRetainedStreamCombi (patterns) {
-    const that = this
     const qlobber = new QlobberTrue(qlobberOpts)
 
     for (const pattern of patterns) {
       qlobber.add(pattern)
     }
 
-    const stream = through.obj(that._getRetainedChunkBound)
-
-    this._db.hkeys(RETAINEDKEY, function getKeys (err, keys) {
-      if (err) {
-        stream.emit('error', err)
-      } else {
-        matchRetained(stream, keys, qlobber)
-      }
-    })
-
-    return pump(stream, throughv.obj(decodeRetainedPacket))
+    return Readable.from(matchRetained(this._db, qlobber, this.hasClusters))
   }
 
   createRetainedStream (pattern) {
@@ -217,7 +294,7 @@ class RedisPersistence extends CachedPersistence {
         return cb(err)
       }
 
-      cb(null, that._trie.subscriptionsCount, parseInt(count) || 0)
+      cb(null, that._trie.subscriptionsCount, Number.parseInt(count) || 0)
     })
   }
 
@@ -232,35 +309,22 @@ class RedisPersistence extends CachedPersistence {
     cb(null, result)
   }
 
-  _setup () {
+  async _setup () {
     if (this.ready) {
       return
     }
 
-    const that = this
-
-    const hgetallStream = throughv.obj(function getStream (clientId, enc, cb) {
-      that._db.hgetallBuffer(clientSubKey(clientId), function clientHash (err, hash) {
-        cb(err, { clientHash: hash, clientId })
-      })
-    }, function emitReady (cb) {
-      that.ready = true
-      that.emit('ready')
-      cb()
-    }).on('data', function processKeys (data) {
-      processKeysForClient(data.clientId, data.clientHash, that)
-    })
-
-    this._db.smembers(CLIENTSKEY, function smembers (err, clientIds) {
-      if (err) {
-        hgetallStream.emit('error', err)
-      } else {
-        for (const clientId of clientIds) {
-          hgetallStream.write(clientId)
-        }
-        hgetallStream.end()
+    try {
+      const clientIds = await this._db.smembers(CLIENTSKEY)
+      for await (const clientId of clientIds) {
+        const clientHash = await this._db.hgetallBuffer(clientSubKey(clientId))
+        processKeysForClient(clientId, clientHash, this._trie)
       }
-    })
+      this.ready = true
+      this.emit('ready')
+    } catch (err) {
+      this.emit('error', err)
+    }
   }
 
   outgoingEnqueue (sub, packet, cb) {
@@ -280,7 +344,15 @@ class RedisPersistence extends CachedPersistence {
 
     const encoded = msgpack.encode(new Packet(packet))
 
-    this._db.mset(pktKey, encoded, countKey, subs.length, finish)
+    if (this.hasClusters) {
+      // do not do this using `mset`, fails in clusters
+      outstanding += 1
+      this._db.set(pktKey, encoded, finish)
+      this._db.set(countKey, subs.length, finish)
+    } else {
+      this._db.mset(pktKey, encoded, countKey, subs.length, finish)
+    }
+
     if (ttl > 0) {
       outstanding += 2
       this._db.expire(pktKey, ttl, finish)
@@ -330,6 +402,7 @@ class RedisPersistence extends CachedPersistence {
     }
 
     let count = 0
+    let expected = 3
     let errored = false
 
     // TODO can be cached in case of wildcard deliveries
@@ -365,7 +438,14 @@ class RedisPersistence extends CachedPersistence {
           return cb(err)
         }
         if (remained === 0) {
-          that._db.del(pktKey, countKey, finish)
+          if (that.hasClusters) {
+            expected++
+            // do not remove multiple keys at once, fails in clusters
+            that._db.del(pktKey, finish)
+            that._db.del(countKey, finish)
+          } else {
+            that._db.del(pktKey, countKey, finish)
+          }
         } else {
           finish()
         }
@@ -377,7 +457,7 @@ class RedisPersistence extends CachedPersistence {
           errored = err
           return cb(err)
         }
-        if (count === 3 && !errored) {
+        if (count === expected && !errored) {
           cb(err, origPacket)
         }
       }
@@ -386,22 +466,17 @@ class RedisPersistence extends CachedPersistence {
 
   outgoingStream (client) {
     const clientListKey = outgoingKey(client.id)
-    const stream = throughv.obj(this._buildAugment(clientListKey))
+    const db = this._db
+    const maxSessionDelivery = this.maxSessionDelivery
 
-    this._db.lrange(clientListKey, 0, this.maxSessionDelivery, lrangeResult)
-
-    function lrangeResult (err, results) {
-      if (err) {
-        stream.emit('error', err)
-      } else {
-        for (const result of results) {
-          stream.write(result)
-        }
-        stream.end()
+    async function * lrangeResult () {
+      const results = await db.lrange(clientListKey, 0, maxSessionDelivery)
+      for (const key of results) {
+        yield getDecodedValue(db, clientListKey, key)
       }
     }
 
-    return stream
+    return Readable.from(lrangeResult())
   }
 
   incomingStorePacket (client, packet, cb) {
@@ -478,23 +553,7 @@ class RedisPersistence extends CachedPersistence {
   }
 
   streamWill (brokers) {
-    const stream = throughv.obj(this._buildAugment(WILLSKEY))
-
-    this._db.lrange(WILLSKEY, 0, 10000, streamWill)
-
-    function streamWill (err, results) {
-      if (err) {
-        stream.emit('error', err)
-      } else {
-        for (const result of results) {
-          if (!brokers || !brokers[result.split(':')[1]]) {
-            stream.write(result)
-          }
-        }
-        stream.end()
-      }
-    }
-    return stream
+    return Readable.from(createWillStream(this._db, brokers, this.maxWills))
   }
 
   * #getClientIdFromEntries (entries) {
@@ -539,7 +598,37 @@ class RedisPersistence extends CachedPersistence {
     }
   }
 
+  clearSharedSubscriptionCache () {
+    this.sharedCachedQlobber = new Qlobber(qlobberOpts)
+    this.cachedSharedTopicsToGroups = new Map()
+    this.cachedSharedGroupsClientTopics = new Map()
+  }
+
+  storeSharedSubscriptionToCache (topic, group, clientId) {
+    const groupTopic = group + '_' + topic
+    const clientTopic = this.buildClientSharedTopic(group, clientId)
+
+    this.sharedCachedQlobber.add(topic, topic)
+
+    const groupsToTopics = this.cachedSharedTopicsToGroups.get(topic)
+    if (groupsToTopics) {
+      groupsToTopics.add(groupTopic)
+    } else {
+      this.cachedSharedTopicsToGroups.set(topic, new Set([groupTopic]))
+    }
+
+    const groupClients = this.cachedSharedGroupsClientTopics.get(groupTopic)
+    if (groupClients) {
+      groupClients.add(clientTopic)
+    } else {
+      this.cachedSharedGroupsClientTopics.set(groupTopic, new Set([clientTopic]))
+    }
+  }
+
   storeSharedSubscription (topic, group, clientId, cb) {
+    if (this.sharedCacheRefreshIntervalSec) {
+      this.storeSharedSubscriptionToCache(topic, group, clientId)
+    }
     const clientTopic = this.buildClientSharedTopic(group, clientId)
     const groupTopic = group + '_' + topic
     const pipeline = this._db.multi()
@@ -562,7 +651,7 @@ class RedisPersistence extends CachedPersistence {
         // So if broker and client alive - topic will persist, if not - will be wiped
         this.subscriptionTimers[clientId][groupTopic] = setInterval(() => {
           this.storeSharedSubscription(topic, group, clientId, () => {})
-        }, 10 * 1000)
+        }, this.sharedSubscriptionRestoreIntervalSec * 1000)
       }
 
       if (!this._cleanupOldShared) {
@@ -609,17 +698,16 @@ class RedisPersistence extends CachedPersistence {
   }
 
   removeSharedSubscriptionFromCache (topic, group, clientId) {
-    const groupTopicKey = group + '_' + topic
+    const groupTopic = group + '_' + topic
     const clientTopic = this.buildClientSharedTopic(group, clientId)
-    const groupClients = this.cachedSharedGroupsClientTopics.get(groupTopicKey)
+    const groupClients = this.cachedSharedGroupsClientTopics.get(groupTopic)
     if (groupClients && groupClients.size !== 0) {
       groupClients.delete(clientTopic)
       if (groupClients.size === 0) {
         const groupsToTopics = this.cachedSharedTopicsToGroups.get(topic)
         if (groupsToTopics && groupsToTopics.size !== 0) {
-          groupsToTopics.delete(groupTopicKey)
+          groupsToTopics.delete(groupTopic)
           if (groupsToTopics.size === 0) {
-            this.cachedSharedTopics.delete(topic)
             this.sharedCachedQlobber.remove(topic)
           }
         }
@@ -667,46 +755,50 @@ class RedisPersistence extends CachedPersistence {
         return cb(null)
       }
 
-      that.sharedCachedQlobber = new Qlobber(qlobberOpts)
-      that.cachedSharedTopics = new Set(sharedTopics)
+      const newSharedCachedQlobber = new Qlobber(qlobberOpts)
+      const newCachedSharedTopicsToGroups = new Map()
+
       const pipeline = that._db.pipeline()
       sharedTopics.forEach((topicFromResult) => {
-        that.sharedCachedQlobber.add(topicFromResult, topicFromResult)
+        newSharedCachedQlobber.add(topicFromResult, topicFromResult)
         pipeline.smembers(topicFromResult)
       })
 
       // Execute pipeline
-      const allClientTopics = []
+      const allGroupTopics = []
       pipeline.exec((err, replies) => {
         if (err) {
           cb(err)
         } else {
           // Map replies to topics
-          that.cachedSharedTopicsToGroups = new Map()
           replies.forEach((reply, index) => {
             if (reply[1] && reply[1].length > 0) {
               const topic = sharedTopics[index]
-              that.cachedSharedTopicsToGroups.set(topic, new Set(reply[1]))
+              newCachedSharedTopicsToGroups.set(topic, new Set(reply[1]))
               reply[1].forEach((clientTopic) => {
-                allClientTopics.push(clientTopic)
+                allGroupTopics.push(clientTopic)
               })
             }
           })
           const pipelineForGroups = that._db.pipeline()
-          allClientTopics.forEach((item) => {
+          allGroupTopics.forEach((item) => {
             pipelineForGroups.smembers(item)
           })
           pipelineForGroups.exec((err, groupsReplies) => {
             if (err) {
               cb(err)
             } else {
-              // Map replies to topics
+              // Updating shared state only in the very end to make it visible to getSharedTopicsFromCache.
+              // Otherwise it could observe inconsistent state.
+              that.sharedCachedQlobber = newSharedCachedQlobber
+              that.cachedSharedTopicsToGroups = newCachedSharedTopicsToGroups
               that.cachedSharedGroupsClientTopics = new Map()
               groupsReplies.forEach((reply, index) => {
-                that.cachedSharedGroupsClientTopics.set(allClientTopics[index], new Set(reply[1]))
+                const groupTopic = allGroupTopics[index]
+                const clientTopics = reply[1]
+                that.cachedSharedGroupsClientTopics.set(groupTopic, new Set(clientTopics))
               })
 
-              that.lastCacheRefreshTs = (Date.now() / 1000)
               cb(null)
             }
           })
@@ -719,13 +811,11 @@ class RedisPersistence extends CachedPersistence {
     const resultTopics = []
     const matches = this.sharedCachedQlobber.match(topic)
     for (const match of matches) {
-      if (this.cachedSharedTopics.has(match)) {
-        const groups = this.cachedSharedTopicsToGroups.get(match)
-        for (const group of groups) {
-          const clientTopics = Array.from(this.cachedSharedGroupsClientTopics.get(group))
-          const randomTopic = clientTopics[Math.floor(Math.random() * clientTopics.length)]
-          resultTopics.push(randomTopic + topic)
-        }
+      const groups = this.cachedSharedTopicsToGroups.get(match) ?? []
+      for (const group of groups) {
+        const clientTopics = Array.from(this.cachedSharedGroupsClientTopics.get(group))
+        const randomTopic = clientTopics[Math.floor(Math.random() * clientTopics.length)]
+        resultTopics.push(randomTopic + topic)
       }
     }
     cb(null, resultTopics)
@@ -733,16 +823,7 @@ class RedisPersistence extends CachedPersistence {
 
   getSharedTopics (topic, cb) {
     if (this.sharedCacheRefreshIntervalSec) {
-      if (this.lastCacheRefreshTs + this.sharedCacheRefreshIntervalSec < (Date.now() / 1000)) {
-        this.fillSharedCache((err) => {
-          if (err) {
-            cb(err)
-          }
-          this.getSharedTopicsFromCache(topic, cb)
-        })
-      } else {
-        this.getSharedTopicsFromCache(topic, cb)
-      }
+      this.getSharedTopicsFromCache(topic, cb)
     } else {
       const luaScript = `
         local inputTopics = ARGV
@@ -837,17 +918,13 @@ class RedisPersistence extends CachedPersistence {
   }
 }
 
-function matchRetained (stream, keys, qlobber) {
-  for (const key of keys) {
-    if (qlobber.test(key)) {
-      stream.write(key)
+async function * matchRetained (db, qlobber, hasClusters) {
+  for (const key of await getRetainedKeys(db, hasClusters)) {
+    const topic = hasClusters ? decodeURIComponent(key.split(':')[1]) : key
+    if (qlobber.test(topic)) {
+      yield getRetainedValue(db, topic, hasClusters)
     }
   }
-  stream.end()
-}
-
-function decodeRetainedPacket (chunk, enc, cb) {
-  cb(null, msgpack.decode(chunk))
 }
 
 function toSub (topic) {
@@ -866,18 +943,25 @@ function returnSubsForClient (subs) {
   }
 
   for (const subKey of subKeys) {
-    toReturn.push(msgpack.decode(subs[subKey]))
+    if (subs[subKey].length === 1) { // version 8x fallback, QoS saved not encoded object
+      toReturn.push({
+        topic: subKey,
+        qos: Number.parseInt(subs[subKey])
+      })
+    } else {
+      toReturn.push(msgpack.decode(subs[subKey]))
+    }
   }
 
   return toReturn
 }
 
-function processKeysForClient (clientId, clientHash, that) {
+function processKeysForClient (clientId, clientHash, trie) {
   const topics = Object.keys(clientHash)
   for (const topic of topics) {
     const sub = msgpack.decode(clientHash[topic])
     sub.clientId = clientId
-    that._trie.add(topic, sub)
+    trie.add(topic, sub)
   }
 }
 
@@ -891,9 +975,8 @@ function updateWithClientData (that, client, packet, cb) {
     that.messageIdCache.set(messageIdKey, pktKey)
     if (ttl > 0) {
       return that._db.set(pktKey, msgpack.encode(packet), 'EX', ttl, updatePacket)
-    } else {
-      return that._db.set(pktKey, msgpack.encode(packet), updatePacket)
     }
+    return that._db.set(pktKey, msgpack.encode(packet), updatePacket)
   }
 
   // qos=2

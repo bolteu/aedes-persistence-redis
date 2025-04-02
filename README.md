@@ -1,8 +1,6 @@
 # aedes-persistence-redis
 
-![.github/workflows/ci.yml](https://github.com/moscajs/aedes-persistence-redis/workflows/.github/workflows/ci.yml/badge.svg)
-[![Dependencies Status](https://david-dm.org/moscajs/aedes-persistence-redis/status.svg)](https://david-dm.org/moscajs/aedes-persistence-redis)
-[![devDependencies Status](https://david-dm.org/moscajs/aedes-persistence-redis/dev-status.svg)](https://david-dm.org/moscajs/aedes-persistence-redis?type=dev)
+![.github/workflows/ci.yml](https://github.com/moscajs/aedes-persistence-redis/actions/workflows/.github/workflows/ci.yml/badge.svg)
 \
 [![Known Vulnerabilities](https://snyk.io/test/github/moscajs/aedes-persistence-redis/badge.svg)](https://snyk.io/test/github/moscajs/aedes-persistence-redis)
 [![Coverage Status](https://coveralls.io/repos/moscajs/aedes-persistence-redis/badge.svg?branch=master&service=github)](https://coveralls.io/github/moscajs/aedes-persistence-redis?branch=master)
@@ -62,7 +60,8 @@ aedesPersistenceRedis({
   }, {
     port: 6380,
     host: '127.0.0.1'
-  }])
+  }]),
+  cluster: true
 })
 ```
 
