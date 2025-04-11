@@ -81,11 +81,24 @@ async function getRetainedKeys (db, hasClusters) {
   return await db.hkeys(RETAINEDKEY)
 }
 
-async function getRetainedValue (db, topic, hasClusters) {
+async function getRetainedValueBuffer (db, topic, hasClusters) {
   if (hasClusters === true) {
-    return msgpack.decode(await db.getBuffer(retainedKey(topic)))
+    return db.getBuffer(retainedKey(topic))
   }
-  return msgpack.decode(await db.hgetBuffer(RETAINEDKEY, topic))
+  return db.hgetBuffer(RETAINEDKEY, topic)
+}
+
+async function getRetainedValue (db, topic, hasClusters) {
+  return msgpack.decode(await getRetainedValueBuffer(db, topic, hasClusters))
+}
+
+async function * getRetainedValuesStream (db, topics, hasClusters) {
+  for (const topic of topics) {
+    const buffer = await getRetainedValueBuffer(db, topic, hasClusters)
+    if (buffer && buffer.length > 0) {
+      yield msgpack.decode(buffer)
+    }
+  }
 }
 
 async function * createWillStream (db, brokers, maxWills) {
@@ -185,6 +198,11 @@ class RedisPersistence extends CachedPersistence {
   }
 
   createRetainedStreamCombi (patterns) {
+    const hasWildcard = patterns.some((pattern) => pattern.includes('+') || pattern.includes('#'))
+    if (!hasWildcard) {
+      return Readable.from(getRetainedValuesStream(this._db, patterns, this.hasClusters))
+    }
+
     const qlobber = new QlobberTrue(qlobberOpts)
 
     for (const pattern of patterns) {
