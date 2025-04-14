@@ -144,7 +144,8 @@ class RedisPersistence extends CachedPersistence {
 
     this.logger = opts.logger || new NoopLogger()
 
-    this.retainedValuesQueryThreshold = opts.retained_values_query_threshold || 1
+    // By default retained values query optimization is disabled (-1)
+    this.retainedValuesQueryThreshold = opts.retained_values_query_threshold || -1
 
     if (this.sharedCacheRefreshIntervalSec) {
       this.once('ready', () => {
