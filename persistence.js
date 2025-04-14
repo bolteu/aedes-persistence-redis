@@ -200,6 +200,10 @@ class RedisPersistence extends CachedPersistence {
     }
   }
 
+  async getRetainedKeys () {
+    return getRetainedKeys(this._db, this.hasClusters)
+  }
+
   hasWildcard (patterns) {
     return patterns.some((pattern) => pattern.includes('+') || pattern.includes('#'))
   }
